@@ -31,7 +31,8 @@ numpy 的 cp314 轮子是按正式版 ABI 编译的，加载时会报
 | `detect_pieces.py` | 棋子检测 + 红黑判断 | `python vision/detect_pieces.py --image <图> --mode gt --compare-gt` |
 | `recognize_chars.py` | 棋子汉字识别（模板匹配 + 角度搜索） | `python vision/recognize_chars.py --image <图> --mode gt --compare-gt` |
 | `pipeline.py` | **端到端主入口**：图 → 校正 → 检测 → 识别 → 结果图/JSON/统计 | `python vision/pipeline.py --image <图> --mode gt --compare-gt` |
-| `realtime.py` | **实时识别**：相机/视频 → 车前视窗校正 → 检测 → 带预算识别 → 输出 | `python vision/realtime.py --source 0` |
+| `realtime.py` | **实时识别**：相机/视频 → 车前视窗校正 → 检测 → 带预算识别 → 棋局理解 → 输出 | `python vision/realtime.py --source 0` |
+| `game.py` | **棋局理解层**：区域判定、得分统计、推扫目标聚类、推进规划、串口帧 | `python vision/game.py`（自测） |
 
 数据目录（都在 `.gitignore` 里，不进仓库；`calib/` 例外，标定结果要入库）：
 
@@ -143,7 +144,42 @@ mm/px=2.0，每帧新认 1 枚：平均 24 ms → 41 FPS
    正式上车时要用里程计/IMU 的位姿把检测结果换算到**场地坐标系**，再缓存；
    这一步等底盘能跑之后再接（`RealtimeVision.process` 里加一次坐标变换即可）。
 
-## 八、坑（都已经踩过并处理）
+## 八、棋局理解层（game.py）—— 视觉和"比赛"之间的那一层
+
+视觉层只回答"哪儿有棋子、是哪一方的、是什么棋"。比赛真正要的是下面这些问题，
+都在 `game.py` 里：
+
+| 功能 | 函数 | 说明 |
+| --- | --- | --- |
+| 区域判定 | `classify_zone()` | 每枚棋子在己方球门区 / 对方球门区 / 棋子堆放区 / 对抗区 |
+| 得分统计 | `count_value()` / `GoalCounter` | 见下面的"两种得分"说明 |
+| **推扫目标聚类** | `cluster_pieces()` / `rank_clusters()` | 找"一铲能带走的一堆"：分值合计最大的簇优先，而不是最近的一枚 |
+| 推进规划 | `plan_push()` | 给出对准点、车头朝向、推进距离——控制层直接照着走 |
+| 给下位机的数据 | `serial_frame()` | `$PUSH,对准X,对准Y,朝向,推进距离,预期分值,枚数*校验` |
+| 坐标换算 | `to_field_frame()` | 车体坐标 → 场地坐标（需要里程计位姿，`--pose x y theta`） |
+
+### 两种"得分"别搞混
+
+- `in_view_value`：**当前画面里**落在己方球门区内的棋子分值（只在投放那几帧有意义）。
+- `GoalCounter.total`：**视野累计**——只要看到棋子出现在己方球门区就加一次（按位置去重）。
+  这是真实得分的**下界**，用于策略和复盘；正式判分以主办方为准。
+- 车头相机看不到整个球门区，所以"累计得分"一定要靠事件累加，不能靠单帧画面。
+
+### 规则未定项（会影响这里的行为）
+
+赛题原文只说"推动棋子整体进入己方球门区，按棋子对应分值累计得分"，没说是否区分颜色。
+所以在 `config.py` 里留了两个开关，拿到细则后一行就能改：
+
+```python
+OWN_SIDE = None            # "red" / "black" / None（未定，先按不区分颜色统计）
+SCORE_MODE = "own_color"   # own_color=只算本队颜色；any_color=推进去就算
+```
+
+`CLUSTER_R`（默认 220mm）定义"一铲"的概念，取值约等于推板有效宽度的一半；
+单链聚类会把连片的棋子串成一大簇，所以如果你希望上层一次只处理一小片，
+把它调到 120~150mm。
+
+## 九、坑（都已经踩过并处理）
 
 1. **`cv2.imread` / `cv2.imwrite` 遇到中文路径会静默失败**（返回 None / 不报错）。
    本项目统一用 `common.imread_cn / imwrite_cn`（先编解码再用 Python 读写文件）。

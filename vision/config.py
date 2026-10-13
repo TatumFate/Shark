@@ -77,3 +77,13 @@ FONT_QI = [r"C:\Windows\Fonts\simkai.ttf",  # 楷体：最常见的象棋字体
            r"C:\Windows\Fonts\simhei.ttf"]  # 黑体：另一种常见写法
 
 FRAME = "field"                   # 标定坐标系：field=整场地俯视(调试/俯拍)；robot=车体坐标系
+
+# ---------------------------------------------------------------- 棋局（策略层）
+# 赛题原文：车辆推动棋子整体进入己方球门区，按棋子对应分值累计得分。
+# 【未确认】是否区分颜色（只算本队颜色 / 推进去就算分）——拿到细则后改这里。
+OWN_SIDE = None                   # 本队颜色："red" / "black" / None(未定，先两边都显示)
+SCORE_MODE = "own_color"          # own_color=只算己方颜色；any_color=推进去就算
+
+CLUSTER_R = 220.0                 # 推扫目标聚类半径(mm)：一铲能带走的范围
+BLADE_AHEAD_MM = 150.0            # 推板中心到车体中心的距离(mm)，按实际结构实测改
+GOAL_SAFE_MARGIN = 60.0           # 距场地边界的余量(mm)

@@ -23,6 +23,7 @@ import common  # noqa: E402
 import config  # noqa: E402
 import detect_pieces as dp  # noqa: E402
 import recognize_chars as rc  # noqa: E402
+import game  # noqa: E402
 
 
 def in_goal_zone(x, y):
@@ -95,6 +96,15 @@ def main():
           f"平均 {(t_rec - t_det) / max(len(pieces), 1) * 1000:.0f} ms/枚）")
 
     summarize(pieces)
+    # 棋局理解：区域判定 + 推扫目标聚类 + 推进规划
+    state = game.build_state(pieces)
+    print("-" * 64)
+    print("棋局：", state["brief"])
+    for c in state["plans"]:
+        print(f"   候选簇 {c['n']} 枚 {''.join(c['chars'])} 合计 {c['value']} 分  "
+              f"距球门 {c['dist_goal'] / 1000:.2f}m  优先级 {c['priority']}")
+        print(f"      对准 {c['plan']['aim']} mm  车头 {c['plan']['heading_deg']}°  "
+              f"推进 {c['plan']['push_mm'] / 1000:.2f}m")
     common.save_json(pieces, config.DIR_OUTPUT / f"{args.name}.json")
     view = rc.annotate(rect, pieces, mm_per_px)
     common.imwrite_cn(config.DIR_OUTPUT / f"{args.name}_annotated.png", view)
