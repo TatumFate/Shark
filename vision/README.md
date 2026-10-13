@@ -31,6 +31,7 @@ numpy 的 cp314 轮子是按正式版 ABI 编译的，加载时会报
 | `detect_pieces.py` | 棋子检测 + 红黑判断 | `python vision/detect_pieces.py --image <图> --mode gt --compare-gt` |
 | `recognize_chars.py` | 棋子汉字识别（模板匹配 + 角度搜索） | `python vision/recognize_chars.py --image <图> --mode gt --compare-gt` |
 | `pipeline.py` | **端到端主入口**：图 → 校正 → 检测 → 识别 → 结果图/JSON/统计 | `python vision/pipeline.py --image <图> --mode gt --compare-gt` |
+| `realtime.py` | **实时识别**：相机/视频 → 车前视窗校正 → 检测 → 带预算识别 → 输出 | `python vision/realtime.py --source 0` |
 
 数据目录（都在 `.gitignore` 里，不进仓库；`calib/` 例外，标定结果要入库）：
 
@@ -114,7 +115,35 @@ python vision/pipeline.py --image vision/data/synthetic/field_oblique.png --mode
 5. **接车**：把 `pipeline.py` 里的"读图"换成"读相机帧"，
    输出通过串口/CAN 发给 STM32；再加状态机与推棋策略。
 
-## 七、坑（都已经踩过并处理）
+## 七、实时化（realtime.py）
+
+比赛是实时的，但**算子完全相同**：`pipeline.py` 是"一帧"的版本，`realtime.py` 就是把它放进循环。
+区别在三个工程改造，实测把单帧从 780 ms 压到 30 ms 左右：
+
+| 改造 | 做法 | 效果 |
+| --- | --- | --- |
+| 只校正车前视窗 | `rectify_window()` 只把车前 800mm×800mm 校正出来，不校正整块 3m×2m 场地 | 校正 3ms → 0.4ms，检测 513ms → 29ms |
+| 识别带预算 | 每帧最多新认 `--max-rec-per-frame` 枚，其余的沿用缓存 | 识别 264ms → 0.3ms（缓存填满后） |
+| 结果走输出接口 | 每帧返回 `(pieces, ...)`，`top_targets()` 给出候选目标，`--emit-hz` 打 JSON | 接串口时只改一处 |
+
+实测（视窗 800mm、1.5 mm/像素、视窗内塞满 32 枚棋子，属于最坏情况）：
+
+```
+mm/px=1.5，每帧新认 3 枚：平均 38 ms → 26 FPS（缓存填满后稳定 29 ms / 34 FPS）
+mm/px=2.0，每帧新认 1 枚：平均 24 ms → 41 FPS
+回放抖动视频（±6px 位移 + 噪声）：平均 34 ms → 29 FPS
+```
+
+三个必须知道的点：
+
+1. **缓存匹配半径要比棋子直径小**（默认 `0.8 × PIECE_DIA`）。半径取大一点会把两枚相邻的
+   棋子合并成一个缓存条目，症状是"缓存永远只有 26 条、有几枚棋子一直显示 ?"。
+2. **同一帧内一个缓存条目只能被一枚棋子占用**，否则相邻棋子会互相抢身份。
+3. **车体坐标系下缓存只在接近静止时有效**：车一动，同一枚棋子在车体系里的坐标就变了。
+   正式上车时要用里程计/IMU 的位姿把检测结果换算到**场地坐标系**，再缓存；
+   这一步等底盘能跑之后再接（`RealtimeVision.process` 里加一次坐标变换即可）。
+
+## 八、坑（都已经踩过并处理）
 
 1. **`cv2.imread` / `cv2.imwrite` 遇到中文路径会静默失败**（返回 None / 不报错）。
    本项目统一用 `common.imread_cn / imwrite_cn`（先编解码再用 Python 读写文件）。

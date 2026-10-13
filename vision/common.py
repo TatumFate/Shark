@@ -107,6 +107,20 @@ def put_text_cn(img, text, org, size=22, color=(0, 0, 255), font_path=None):
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
+def put_texts_cn(img, items):
+    """一次画多条中文。items = [(文本, (x, y), 字号, BGR颜色), ...]
+
+    实时循环里必须用这个：put_text_cn 每调一次都要把整幅图转成 PIL 再转回来，
+    画十几条标签就会白吃掉几十毫秒。
+    """
+    pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil)
+    for text, org, size, color in items:
+        draw.text((int(org[0]), int(org[1])), text, font=_font(size),
+                  fill=(int(color[2]), int(color[1]), int(color[0])))
+    return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
+
+
 def imread_cn(path, flags=cv2.IMREAD_COLOR):
     """读图（支持中文路径）。
 
