@@ -18,6 +18,7 @@
 """
 import math
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -241,6 +242,116 @@ def rank_clusters(clusters, keep=3):
     return sorted(got, key=lambda c: -c["priority"])[:keep]
 
 
+# ------------------------------------------------------------------ 场地记忆（小视野必需）
+class FieldMemory:
+    """把"见过的棋子"记在场地坐标系里。
+
+    为什么必须要有：车上只有一个前视相机，一帧只能看到一小块地方。
+    如果每帧只看眼前那两三枚，就永远规划不出"先把哪一片扫掉最划算"。
+    有了记忆，车可以边开边把棋子登记进来，规划时用的是**整场台账**，
+    而不是当前这一帧；对已经推进球门区的棋子就把它从台账里划掉。
+
+    局限（要清楚）：棋子被推动后位置会变，而记忆里存的是旧位置。
+    所以每条记忆都带"最后一次看到"的时间，超时（MEMORY_TTL_S）就标记为
+    "可能已移动"，规划时降权，并且优先相信刚刚看到的那一批。
+    """
+
+    def __init__(self, tol_mm=None, ttl_s=None):
+        self.tol = float(tol_mm or config.MEMORY_TOL_MM)
+        self.ttl = float(ttl_s or config.MEMORY_TTL_S)
+        self.items = []            # [{x,y,side,char,value,score,t_seen,hits,zone}]
+
+    def update(self, pieces, now=None):
+        """把这一帧看到的棋子并进台账（同色 + 距离近 → 认为是同一枚）。"""
+        now = time.time() if now is None else now
+        added = []
+        for p in pieces:
+            if not p.get("char"):
+                continue
+            best, bd = None, 1e9
+            for it in self.items:
+                if it["side"] != p["side"] or it.get("gone"):
+                    continue
+                d = math.hypot(it["x"] - p["x"], it["y"] - p["y"])
+                if d < bd:
+                    bd, best = d, it
+            if best is not None and bd <= self.tol:
+                best.update({"x": p["x"], "y": p["y"], "char": p["char"],
+                             "value": p.get("value", 0), "score": p.get("score", 0),
+                             "t_seen": now, "zone": p.get("zone")})
+                best["hits"] = best.get("hits", 1) + 1
+            else:
+                self.items.append({"x": p["x"], "y": p["y"], "side": p["side"],
+                                   "char": p["char"], "value": p.get("value", 0),
+                                   "score": p.get("score", 0), "t_seen": now,
+                                   "zone": p.get("zone"), "hits": 1})
+                added.append(p)
+        # 进了己方球门区的，从"待推台账"里划掉
+        for it in self.items:
+            if it.get("zone") == "own_goal":
+                it["gone"] = True
+        return added
+
+    def snapshot(self, now=None, fresh_only=False):
+        now = time.time() if now is None else now
+        out = []
+        for it in self.items:
+            if it.get("gone"):
+                continue
+            age = now - it["t_seen"]
+            if age > self.ttl:
+                it["stale"] = True
+            if fresh_only and it.get("stale"):
+                continue
+            out.append({**it, "age_s": round(age, 1)})
+        return out
+
+    def clear(self):
+        self.items = []
+
+    def __len__(self):
+        return sum(1 for it in self.items if not it.get("gone"))
+
+
+# ------------------------------------------------------------------ 得分效率：分/秒
+def estimate_seconds(cluster, pose=None, speed_mm_s=None):
+    """跑这一趟大概要几秒：去目标 + 推 + 固定开销。
+
+    pose=(x,y,theta) 是车当前在场地上的位姿；不知道就按"从簇的位置算"。
+    """
+    speed = float(speed_mm_s or config.ROBOT_SPEED_MM_S)
+    if pose:
+        d_to = math.hypot(cluster["x"] - pose[0], cluster["y"] - pose[1])
+    else:
+        d_to = cluster["dist_goal"]          # 保守假设：车就在球门区附近
+    travel = (d_to + cluster["dist_goal"]) / max(speed, 1.0)
+    return travel + config.ALIGN_SEC + config.TRIP_OVERHEAD_S
+
+
+def plan_from_memory(memory, pose=None, speed_mm_s=None, blade_ahead=None,
+                     cluster_r=None, keep=3):
+    """从**整场台账**里挑出"分/秒"最高的一趟，给出规划。
+
+    这直接回答了"先拿分高的还是先拿最近的"：都不是。
+    该看的是得分效率 = 这一趟的总分 ÷ 这一趟花的时间，
+    其中时间 = 开过去 + 推进球门区 + 对准与开销。
+    """
+    clusters = [summarize_cluster(m) for m in cluster_pieces(memory.snapshot(), cluster_r)]
+    got = []
+    for c in clusters:
+        # 记忆里越久没看到的越可能已经被撞走，轻微降权
+        ages = [m.get("age_s", 0) for m in c["members"]]
+        age_pen = 1.0 / (1.0 + (sum(ages) / len(ages)) / max(config.MEMORY_TTL_S, 1.0))
+        eta = estimate_seconds(c, pose, speed_mm_s)
+        got.append({**c,
+                    "eta_s": round(eta, 2),
+                    "rate": round(c["value"] * age_pen / eta, 3),
+                    "priority": round(c["value"] * age_pen / eta, 3),
+                    "plan": plan_push(c, blade_ahead)})
+    got.sort(key=lambda c: -c["rate"])
+    return got[:keep]
+
+
 # ------------------------------------------------------------------ 输出给下位机 / 决策层
 def serial_frame(plan, t_ms=None):
     """一个紧凑的文本帧示例（每帧一行，逗号分隔，末尾 * 校验位）。
@@ -264,24 +375,33 @@ def brief(state):
     if not plans:
         return f"没有可推目标（已识别 {state.get('n_known', 0)} 枚）"
     p = plans[0]
-    return (f"推荐：推 {p['n']} 枚（{''.join(p['chars'])}）合计 {p['value']} 分 "
-            f"→ 朝向 {p['plan']['heading_deg']:.0f}°，推进 {p['plan']['push_mm'] / 1000:.2f}m")
+    eta = f"，预计 {p['eta_s']:.1f}s（{p['rate']:.1f} 分/秒）" if p.get("eta_s") else ""
+    mem = f"记忆 {state['n_memory']} 枚 / " if state.get("n_memory") is not None else ""
+    return (f"{mem}推荐：推 {p['n']} 枚（{''.join(p['chars'])}）合计 {p['value']} 分 "
+            f"→ 朝向 {p['plan']['heading_deg']:.0f}°，推进 {p['plan']['push_mm'] / 1000:.2f}m"
+            f"{eta}")
 
 
-def build_state(pieces, pose=None, scoreboard=None, score_mode=None, own_side=None):
+def build_state(pieces, pose=None, scoreboard=None, score_mode=None, own_side=None,
+                memory=None, blade_ahead=None, cluster_r=None):
     """把视觉结果整理成一份完整的"棋局态势"。
 
     pieces 每枚应含 x, y, side, char, value（recognize_chars 的输出即满足）。
     """
     pieces = annotate_zones(to_field_frame(pieces, pose))
-    clusters = [summarize_cluster(m) for m in cluster_pieces(pieces)]
-    ranked = rank_clusters(clusters)
-    for c in ranked:
-        c["plan"] = plan_push(c)
+    if memory is not None:
+        memory.update(pieces)
+        ranked = plan_from_memory(memory, pose, blade_ahead=blade_ahead, cluster_r=cluster_r)
+    else:
+        ranked = rank_clusters([summarize_cluster(m)
+                                for m in cluster_pieces(pieces, cluster_r)])
+        for c in ranked:
+            c["plan"] = plan_push(c, blade_ahead)
     in_view_value, in_view_n = count_value(pieces, score_mode, own_side)
     state = {
         "pieces": pieces,
         "n_known": sum(1 for p in pieces if p.get("char")),
+        "n_memory": (len(memory) if memory is not None else None),
         "clusters": ranked,
         "plans": ranked,
         "in_view_value": in_view_value,

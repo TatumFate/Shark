@@ -93,55 +93,64 @@ def ink_patch(gray, cx, cy, half, border_margin=2, min_area=3):
     return out if int(out.sum()) > 0 else None
 
 
-def recognize(rect, mm_per_px, pieces, tpl, step=None, size=TPL_SIZE, dilate=1):
+def recognize_crop(bgr, cx, cy, r_px, tpl, side, size=TPL_SIZE, step=None, dilate=1):
+    """对**单枚棋子的局部图**做识别。
+
+    实时识别和"实拍样本自评"共用这一条代码路径——否则评估出来的准确率
+    不代表真实运行时的表现。bgr 可以是原图，灰度也行。
+    """
     mats, _names, chars, sides, fonts = tpl
     step = step or config.ANGLE_STEP
     angles = list(range(0, 360, step))
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
+    half = max(6, int(r_px * 0.70))
+    patches = []
+    for ang in angles:
+        M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
+        rot = cv2.warpAffine(gray, M, (gray.shape[1], gray.shape[0]),
+                             flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
+        ink = ink_patch(rot, cx, cy, half)
+        if ink is None:
+            continue
+        patch = common.normalize_patch(ink, size)
+        if dilate > 0:
+            patch = cv2.dilate(patch, np.ones((3, 3), np.uint8), iterations=dilate)
+        patches.append((ang, patch))
+    if not patches:
+        return None
+    Q = np.stack([q for _a, q in patches]).astype(np.float32)
+    cand = [i for i, s in enumerate(sides) if s == side]
+    if not cand:
+        cand = list(range(len(sides)))
+    S = common.ncc_scores(Q, mats[cand])
+    flat = np.argsort(S.ravel())[::-1]
+    ai, ci = np.unravel_index(flat[0], S.shape)
+    best_char = chars[cand[ci]]
+    second = 0.0
+    for o in flat[1:]:
+        a2, c2 = np.unravel_index(o, S.shape)
+        if chars[cand[c2]] != best_char:
+            second = float(S[a2, c2])
+            break
+    norm = config.NORMALIZE.get(best_char, best_char)
+    return {"char_raw": best_char, "char": norm, "value": config.VALUE.get(norm, 0),
+            "score": round(float(S[ai, ci]), 4),
+            "margin": round(float(S[ai, ci]) - second, 4),
+            "angle": patches[ai][0], "font": fonts[cand[ci]]}
+
+
+def recognize(rect, mm_per_px, pieces, tpl, step=None, size=TPL_SIZE, dilate=1):
+    """对一张（校正后的）图里的一批棋子做识别。"""
     out = []
     for p in pieces:
         roi = piece_roi(rect, p["x"] / mm_per_px, p["y"] / mm_per_px, p["r"] / mm_per_px)
         if roi is None:
             continue
         up, ucx, ucy, ur = roi
-        gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
-        half = max(6, int(ur * 0.70))
-        patches = []
-        for ang in angles:
-            M = cv2.getRotationMatrix2D((ucx, ucy), ang, 1.0)
-            rot = cv2.warpAffine(gray, M, (gray.shape[1], gray.shape[0]),
-                                 flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            ink = ink_patch(rot, ucx, ucy, half)
-            if ink is None:
-                continue
-            patch = common.normalize_patch(ink, size)
-            if dilate > 0:
-                # 相机拍到的笔画通常比字体渲染的细，先膨胀一下再去比，
-                # 否则"细字 vs 粗模板"的相关性会明显偏低。
-                patch = cv2.dilate(patch, np.ones((3, 3), np.uint8), iterations=dilate)
-            patches.append((ang, patch))
-        if not patches:
+        r = recognize_crop(up, ucx, ucy, ur, tpl, p["side"], size, step, dilate)
+        if r is None:
             continue
-        Q = np.stack([q for _a, q in patches]).astype(np.float32)
-        cand = [i for i, s in enumerate(sides) if s == p["side"]]
-        if not cand:
-            cand = list(range(len(sides)))
-        S = common.ncc_scores(Q, mats[cand])
-        flat = np.argsort(S.ravel())[::-1]
-        ai, ci = np.unravel_index(flat[0], S.shape)
-        best_char = chars[cand[ci]]
-        second = 0.0
-        for o in flat[1:]:
-            a2, c2 = np.unravel_index(o, S.shape)
-            if chars[cand[c2]] != best_char:
-                second = float(S[a2, c2])
-                break
-        norm = config.NORMALIZE.get(best_char, best_char)
-        out.append({**p,
-                    "char_raw": best_char, "char": norm,
-                    "value": config.VALUE.get(norm, 0),
-                    "score": round(float(S[ai, ci]), 4),
-                    "margin": round(float(S[ai, ci]) - second, 4),
-                    "angle": patches[ai][0], "font": fonts[cand[ci]]})
+        out.append({**p, **r})
     return out
 
 
@@ -158,6 +167,69 @@ def annotate(rect, pieces, mm_per_px):
         conf = f"{p.get('score', 0):.2f}"
         view = common.put_text_cn(view, conf, (c[0] - r_px, c[1] + r_px + 4), 18, (0, 200, 255))
     return view
+
+
+def read_crop_ratio(sample_dir):
+    """样本的裁切比例（裁出来的边长 = 比例 × 棋子直径），collect_samples 会写进 _meta.json。"""
+    meta = Path(sample_dir) / "_meta.json"
+    if meta.exists():
+        try:
+            return float(common.load_json(meta).get("crop_ratio", 1.5))
+        except Exception:                      # noqa: BLE001
+            pass
+    return 1.5
+
+
+def eval_samples(sample_dir, tpl, step=None):
+    """对**已标注的实拍样本**算识别率。
+
+    文件名格式：`字_颜色_序号.png`，例如 `车_red_01.png`、`卒_black_03.png`。
+    这是拿你自己的棋子、自己的相机、自己的灯光测出来的真实数字——
+    比在合成图上的 78.1% 有意义得多。
+    """
+    sample_dir = Path(sample_dir)
+    ratio = read_crop_ratio(sample_dir)
+    valid = set(config.CHARS_RED) | set(config.CHARS_BLACK)
+    ok = bad = skipped = 0
+    errors, per = [], {}
+    for f in sorted(sample_dir.glob("*.png")):
+        parts = f.stem.split("_")
+        if len(parts) < 2 or parts[0] not in valid or parts[1] not in ("red", "black"):
+            skipped += 1
+            continue
+        char, side = parts[0], parts[1]
+        img = common.imread_cn(f)
+        if img is None:
+            skipped += 1
+            continue
+        h, w = img.shape[:2]
+        r = recognize_crop(img, w / 2.0, h / 2.0, w / (2.0 * ratio), tpl, side, step=step)
+        if r is None:
+            skipped += 1
+            continue
+        want = config.NORMALIZE.get(char, char)
+        key = f"{want}({side})"
+        per.setdefault(key, [0, 0])
+        per[key][1] += 1
+        if r["char"] == want:
+            ok += 1
+            per[key][0] += 1
+        else:
+            bad += 1
+            errors.append((f.name, f"{char}->{r['char']}", round(r["score"], 3)))
+    total = ok + bad
+    print("-" * 60)
+    print(f"实拍样本自评：有效 {total} 张（跳过 {skipped} 张未标注/无法识别）")
+    if total:
+        print(f"识别正确率 {ok / total * 100:5.1f}%   （{ok}/{total}）")
+        for k, (a, b) in sorted(per.items()):
+            if a < b:
+                print(f"   偏弱：{k} {a}/{b}")
+        if errors:
+            print("   错例（文件, 真值→预测, 得分）：")
+            for e in errors[:12]:
+                print(f"     {e[0]:22s} {e[1]:12s} {e[2]}")
+    return ok, total
 
 
 def compare_with_gt(pieces, gt_path, tol=25.0):
@@ -190,7 +262,9 @@ def compare_with_gt(pieces, gt_path, tol=25.0):
 
 def main():
     ap = argparse.ArgumentParser(description="识别棋子上的汉字")
-    ap.add_argument("--image", required=True)
+    ap.add_argument("--image", default=None, help="要识别的图片（做样本自评时可不给）")
+    ap.add_argument("--eval-samples", default=None,
+                    help="只做样本自评：对 data/pieces/samples 里已标注的实拍图算识别率")
     ap.add_argument("--detect-json", default=None, help="不给就现跑一遍检测")
     ap.add_argument("--mode", choices=["calib", "gt"], default="calib")
     ap.add_argument("--frame", default=config.FRAME)
@@ -202,6 +276,14 @@ def main():
     ap.add_argument("--show", action="store_true")
     args = ap.parse_args()
 
+    tpl = load_templates()
+    if args.eval_samples:
+        print(f"载入模板 {len(tpl[0])} 个")
+        eval_samples(args.eval_samples, tpl, args.angle_step)
+        return 0
+
+    if not args.image:
+        raise SystemExit("请给 --image <图片>，或者用 --eval-samples <样本目录>")
     img = common.imread_cn(args.image)
     if img is None:
         raise SystemExit(f"读不到图片：{args.image}")
@@ -220,7 +302,6 @@ def main():
         pieces, used = dp.detect(rect, mm_per_px)
         print(f"现场检测（{used}）得到 {len(pieces)} 枚棋子")
 
-    tpl = load_templates()
     print(f"载入模板 {len(tpl[0])} 个（{len(set(tpl[2]))} 种字 × 多种字体写法）")
     result = recognize(rect, mm_per_px, pieces, tpl, args.angle_step, dilate=args.dilate)
     common.save_json(result, config.DIR_OUTPUT / f"{args.name}.json")

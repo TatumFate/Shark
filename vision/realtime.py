@@ -139,6 +139,9 @@ class RealtimeVision:
                                                # 车体坐标换算成场地坐标；没有就先按原点朝向处理
         self.scoreboard = game.Scoreboard()     # 累计得分（上层状态机也可直接调用）
         self.goal_counter = game.GoalCounter()  # 视野内自动计分（入区即计）
+        # 场地记忆：车头相机一帧只看得到一小块，必须把"见过的棋子"记在场地坐标里，
+        # 规划时才能对整场做取舍（否则永远只能对眼前那两三枚做决定）
+        self.memory = game.FieldMemory()
         self.scored_recent = []                 # 最近一次新进区的棋子，用于界面提示
         # 缓存匹配半径：一定要小于"两枚棋子相贴时的中心距"（=棋子直径），
         # 否则相邻棋子会被合并到同一个缓存条目，导致有的棋子永远认不上。
@@ -260,7 +263,8 @@ class RealtimeVision:
         self.forget_stale(now)
 
         # 6) 棋局理解：区域判定 / 得分 / 目标聚类 / 推进规划
-        state = game.build_state(out, pose=self.pose, scoreboard=self.scoreboard)
+        state = game.build_state(out, pose=self.pose, scoreboard=self.scoreboard,
+                                 memory=self.memory)
         self.scored_recent = self.goal_counter.update(state["pieces"])
         state["cum_total"] = self.goal_counter.total
         state["cum_count"] = self.goal_counter.count
@@ -461,6 +465,7 @@ def main():
         if args.emit_hz > 0 and time.time() - last_emit > 1.0 / args.emit_hz:
             last_emit = time.time()
             print(json.dumps({"n": len(pieces), "fresh": fresh, "cached": len(engine.cache),
+                              "memory": state.get("n_memory"),
                               "ms": round(engine.stats["total"], 1),
                               "score": state.get("cum_total", 0),
                               "in_goal_view": state["in_view_value"],
@@ -479,6 +484,9 @@ def main():
         if key == ord("c"):
             engine.clear_cache()
             print("[清空识别缓存]")
+        if key == ord("m"):
+            engine.memory.clear()
+            print("[清空场地记忆]")
         if key == ord("d"):
             show_rect = not show_rect
         if key == ord(" "):
