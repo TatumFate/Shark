@@ -32,10 +32,16 @@ def homography_path(frame=None):
 
 def load_homography(frame=None, path=None):
     """读取标定结果，返回 (H_image2frame, meta)；没有标定文件时返回 (None, {})。"""
+    explicit = path is not None
     path = Path(path) if path else homography_path(frame)
     if not path.exists():
         return None, {}
     meta = load_json(path)
+    # 防呆：如果这份标定是用合成图算出来的，却在真实照片上使用，必须在第一时间提醒
+    src = str(meta.get("source", ""))
+    if not explicit and "synthetic" in src:
+        print(f"[警告] {path.name} 是用合成图生成的（source={src}）。")
+        print("       真实照片请先重新标定：python vision/calib_field.py --image <真图> --mode pick")
     H = np.array(meta["H"], dtype=np.float64)
     return H, meta
 
