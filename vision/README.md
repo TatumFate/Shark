@@ -189,6 +189,15 @@ SCORE_MODE = "own_color"   # own_color=只算本队颜色；any_color=推进去�
 4. **二值化会连棋子外圈、装饰环一起算成笔画**，导致所有棋子长得一样。
    解决：用连通域分析剔除贴边的笔画（`recognize_chars.ink_patch`）。
 5. **Hough 单组参数漏检严重**，所以跑 3 组参数合并后 NMS 去重。
+6. **空输入会崩**：一帧里一枚棋子都没检出来时，`cv2.perspectiveTransform` 对空数组
+   返回 `None`，接着调 `.reshape()` 就报 `AttributeError: 'NoneType' object has no attribute 'reshape'`。
+   已在 `realtime.to_src()` 里加空输入保护 + `draw_raw_overlay()` 跳过空列表。
+   教训：合成图上永远有 32 枚棋子，**"零枚"这种边界情况只有在真实相机上才会遇到**，
+   写视觉代码要专门造空帧测一遍。
+7. **launch 配置 `8 · 实时识别（用相机）` 默认是车体坐标系**（`--center 500 0`，车前 0.5m），
+   它需要配 `homography_robot.json`（用车上相机做的真实标定）。
+   在没做真实标定之前跑它，画面是没有意义的（还会看到"用的是合成图标定"的黄色告警）。
+   先用配置 `9`（合成图）确认程序正常，或先做标定。
 
 ## 十、把你的实物象棋录进系统（详细步骤）
 

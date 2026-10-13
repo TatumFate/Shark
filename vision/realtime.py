@@ -149,6 +149,7 @@ class RealtimeVision:
         self.cache = []          # [{x, y, side, char, value, score, t_rec, t_seen}]
         self.stats = {"rect": 0.0, "detect": 0.0, "rec": 0.0, "total": 0.0}
         self.H_inv = None
+        self._warned_blank = False
 
     def to_src(self, pts_mm):
         """场地/标定坐标(mm) → 原始图像像素。
@@ -157,6 +158,10 @@ class RealtimeVision:
         给了 pose（车在场地上的位姿）就先把场地坐标换回车体系再投影。
         """
         pts = np.asarray(pts_mm, np.float64).reshape(-1, 2)
+        if pts.size == 0:
+            # 坑：一帧里一枚棋子都没检出来时是空列表，而 cv2.perspectiveTransform
+            # 对空输入会返回 None，接着 .reshape 就会报 'NoneType' has no attribute 'reshape'
+            return np.zeros((0, 2), np.float64)
         if self.pose:
             x0, y0, th = self.pose[0], self.pose[1], math.radians(self.pose[2])
             c, s = math.cos(th), math.sin(th)
@@ -164,7 +169,10 @@ class RealtimeVision:
             pts = np.stack([c * dx + s * dy, -s * dx + c * dy], axis=1)
         if self.H_inv is None:
             self.H_inv = np.linalg.inv(np.asarray(self.H, np.float64))
-        return cv2.perspectiveTransform(pts.reshape(-1, 1, 2), self.H_inv).reshape(-1, 2)
+        out = cv2.perspectiveTransform(pts.reshape(-1, 1, 2), self.H_inv)
+        if out is None:                     # 兜底：OpenCV 在某些输入下会返回 None
+            return np.zeros((0, 2), np.float64)
+        return out.reshape(-1, 2)
 
     # ---- 缓存：棋子不动，认过一次就记着 ----
     def match_cache(self, x, y, side, now, claimed=None):
@@ -192,6 +200,16 @@ class RealtimeVision:
         # 1) 只校正车前视窗
         rect, (ox, oy) = rectify_window(frame, self.H, self.center,
                                         (self.roi_mm, self.roi_mm), self.mm_per_px)
+        # 视窗几乎是黑的 = 落在标定范围之外（warpPerspective 用黑边填充），
+        # 或相机根本没出画面。这是新手最容易犯的错：用"整场地"的标定，
+        # 却给了"车体坐标系"的中心点（反之亦然）。
+        # 注意别用"方差小"来判断——空地板也是低方差，那是正常情况。
+        if not self._warned_blank and float(rect.mean()) < 25.0:
+            self._warned_blank = True
+            print("[提示] 校正出来的视窗几乎是黑的：视窗落在标定范围外，或相机没有画面。")
+            print(f"       当前视窗中心 {self.center} mm，当前坐标系 = {config.FRAME}。"
+                  f"整场地标定的中心要取场地内的点，例如 --center 1500 1000；"
+                  f"车体坐标系的中心取车前，例如 --center 500 0。")
         t1 = time.perf_counter()
 
         # 2) 检测（局部坐标）
@@ -301,27 +319,29 @@ def header_lines(state, fps, stats, paused=False, width=1280):
 def draw_raw_overlay(view, state, to_src, fps, stats, paused=False):
     """在**原始相机图**上画：坐标必须用逆单应投影回去，不能直接当像素用。"""
     pieces = state["pieces"]
-    pts = to_src([[p["x"], p["y"]] for p in pieces])
     fs = _font_size(view.shape[1])
     items = header_lines(state, fps, stats, paused, view.shape[1])
-    for p, (sx, sy) in zip(pieces, pts):
-        if not (0 <= sx < view.shape[1] and 0 <= sy < view.shape[0]):
-            continue
-        sxi, syi = int(sx), int(sy)
-        col = (0, 0, 255) if p["side"] == "red" else (255, 255, 255)
-        cv2.drawMarker(view, (sxi, syi), col, cv2.MARKER_TILTED_CROSS, 16, 2)
-        tcol = (0, 0, 255) if p["side"] == "red" else (0, 255, 0)
-        if not p["fresh"]:
-            tcol = tuple(int(c * 0.6) for c in tcol)
-        items.append((p["char"] or "?", (sxi + 10, syi - int(fs * 1.5)), fs + 4, tcol))
+    if pieces:                                   # 空帧（一枚都没检出）就直接跳过，别崩
+        pts = to_src([[p["x"], p["y"]] for p in pieces])
+        for p, (sx, sy) in zip(pieces, pts):
+            if not (0 <= sx < view.shape[1] and 0 <= sy < view.shape[0]):
+                continue
+            sxi, syi = int(sx), int(sy)
+            col = (0, 0, 255) if p["side"] == "red" else (255, 255, 255)
+            cv2.drawMarker(view, (sxi, syi), col, cv2.MARKER_TILTED_CROSS, 16, 2)
+            tcol = (0, 0, 255) if p["side"] == "red" else (0, 255, 0)
+            if not p["fresh"]:
+                tcol = tuple(int(c * 0.6) for c in tcol)
+            items.append((p["char"] or "?", (sxi + 10, syi - int(fs * 1.5)), fs + 4, tcol))
     # 推荐簇：从"对准点"指向簇中心画一条箭头，就是推扫方向
     for c in state["plans"][:2]:
-        aim = np.array([[c["plan"]["aim"][0], c["plan"]["aim"][1]]], np.float64)
-        cen = np.array([[c["x"], c["y"]]], np.float64)
-        (ax, ay), (cx, cy) = to_src(aim)[0], to_src(cen)[0]
+        proj = to_src([[c["plan"]["aim"][0], c["plan"]["aim"][1]], [c["x"], c["y"]]])
+        if len(proj) < 2:
+            continue
+        (ax, ay), (cx, cy) = proj
         cv2.arrowedLine(view, (int(ax), int(ay)), (int(cx), int(cy)), (0, 255, 255), 3,
                         tipLength=0.25)
-        items.append((f"{c['value']}分/{c['n']}枚", (int(cx) + 8, int(cy) + 10), 22, (0, 255, 255)))
+        items.append((f"{c['value']}分/{c['n']}枚", (int(cx) + 8, int(cy) + 10), fs, (0, 255, 255)))
     return common.put_texts_cn(view, items)
 
 
