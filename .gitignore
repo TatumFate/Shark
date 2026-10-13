@@ -15,6 +15,7 @@ vision/data/synthetic/
 !vision/data/calib/
 
 # ---- 编辑器 / 系统 ----
+.vscode/
 .idea/
 .DS_Store
 Thumbs.db

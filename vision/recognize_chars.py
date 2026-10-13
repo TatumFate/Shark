@@ -55,11 +55,16 @@ def piece_roi(rect, cx, cy, r, scale=2.0):
     return up, (cx - x0) * scale, (cy - y0) * scale, r * scale
 
 
-def ink_patch(gray, cx, cy, half, mask_r=None):
-    """从灰度小图里取中心方块并二值化出笔画（自适应，不依赖固定灰度）。
+def ink_patch(gray, cx, cy, half, border_margin=2, min_area=3):
+    """从灰度小图里取中心方块，得到"笔画强度图"（自适应，不依赖固定灰度）。
 
-    mask_r：圆形遮罩半径。必须用！否则棋子边缘的圆环、装饰线都会被当成"笔画"，
-    所有棋子二值化后长得几乎一样，识别率会崩到 50% 以下。
+    为什么要"剔除贴边的连通域"：棋子外圈描边、装饰圆环、盘面外的地面，
+    在二值化后都会变成"笔画"，而且它们面积大、都贴着取图边缘，
+    结果所有棋子看起来几乎一样，识别率会崩到 50%。字符在盘面中间，不会被误删。
+
+    为什么用"强度图"而不是黑白二值：相机远、字细时，笔画灰度可能只比盘面暗
+    30~60 灰阶，硬二值化会把笔画切成一堆碎点，形状信息就丢了。
+    保留灰度（比盘面暗多少 → 0~255）能显著提升这种低对比度字的识别率。
     """
     x0, y0 = int(round(cx - half)), int(round(cy - half))
     x1, y1 = int(round(cx + half)), int(round(cy + half))
@@ -68,18 +73,27 @@ def ink_patch(gray, cx, cy, half, mask_r=None):
     sub = gray[y0:y1, x0:x1]
     if sub.size < 16:
         return None
-    base = float(np.percentile(sub, 80))
-    ink = ((sub < base - config.INK_DELTA).astype(np.uint8)) * 255
-    if mask_r:
-        h, w = ink.shape
-        yy, xx = np.mgrid[0:h, 0:w]
-        cyy, cxx = cy - y0, cx - x0
-        outside = ((yy - cyy) ** 2 + (xx - cxx) ** 2) > mask_r ** 2
-        ink[outside] = 0
-    return ink
+    subf = sub.astype(np.float32)
+    base = float(np.percentile(subf, 80))
+    hard = ((subf < base - config.INK_DELTA).astype(np.uint8)) * 255
+    n, lab, stats, _ = cv2.connectedComponentsWithStats(hard, 8)
+    keep = np.zeros(hard.shape, bool)
+    h, w = hard.shape
+    for i in range(1, n):
+        bx, by, bw, bh, area = stats[i]
+        if area < min_area:
+            continue
+        if (bx <= border_margin or by <= border_margin
+                or bx + bw >= w - border_margin or by + bh >= h - border_margin):
+            continue                      # 贴边 → 外圈/装饰环/地面，丢掉
+        keep |= (lab == i)
+    if keep.sum() < max(20, 0.05 * float((hard > 0).sum())):
+        keep = np.ones_like(keep)         # 兜底：万一字太大被删光，就用全部
+    out = np.where(keep, hard, 0).astype(np.uint8)
+    return out if int(out.sum()) > 0 else None
 
 
-def recognize(rect, mm_per_px, pieces, tpl, step=None, size=TPL_SIZE):
+def recognize(rect, mm_per_px, pieces, tpl, step=None, size=TPL_SIZE, dilate=1):
     mats, _names, chars, sides, fonts = tpl
     step = step or config.ANGLE_STEP
     angles = list(range(0, 360, step))
@@ -96,10 +110,15 @@ def recognize(rect, mm_per_px, pieces, tpl, step=None, size=TPL_SIZE):
             M = cv2.getRotationMatrix2D((ucx, ucy), ang, 1.0)
             rot = cv2.warpAffine(gray, M, (gray.shape[1], gray.shape[0]),
                                  flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REPLICATE)
-            ink = ink_patch(rot, ucx, ucy, half, mask_r=ur * 0.75)
+            ink = ink_patch(rot, ucx, ucy, half)
             if ink is None:
                 continue
-            patches.append((ang, common.normalize_patch(ink, size)))
+            patch = common.normalize_patch(ink, size)
+            if dilate > 0:
+                # 相机拍到的笔画通常比字体渲染的细，先膨胀一下再去比，
+                # 否则"细字 vs 粗模板"的相关性会明显偏低。
+                patch = cv2.dilate(patch, np.ones((3, 3), np.uint8), iterations=dilate)
+            patches.append((ang, patch))
         if not patches:
             continue
         Q = np.stack([q for _a, q in patches]).astype(np.float32)
@@ -177,6 +196,7 @@ def main():
     ap.add_argument("--frame", default=config.FRAME)
     ap.add_argument("--mm-per-px", type=float, default=config.MM_PER_PX)
     ap.add_argument("--angle-step", type=int, default=config.ANGLE_STEP)
+    ap.add_argument("--dilate", type=int, default=1, help="笔画膨胀次数，0=不膨胀")
     ap.add_argument("--name", default="recognize")
     ap.add_argument("--compare-gt", action="store_true")
     ap.add_argument("--show", action="store_true")
@@ -202,7 +222,7 @@ def main():
 
     tpl = load_templates()
     print(f"载入模板 {len(tpl[0])} 个（{len(set(tpl[2]))} 种字 × 多种字体写法）")
-    result = recognize(rect, mm_per_px, pieces, tpl, args.angle_step)
+    result = recognize(rect, mm_per_px, pieces, tpl, args.angle_step, dilate=args.dilate)
     common.save_json(result, config.DIR_OUTPUT / f"{args.name}.json")
 
     print(f"识别出 {len(result)} 枚，按分值统计：")
