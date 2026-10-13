@@ -1,0 +1,25 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 视觉工程产生的中间数据（体积大，不入库）----
+vision/data/raw/
+vision/data/output/
+vision/data/templates/
+vision/data/synthetic/
+
+# 标定结果建议入库（很重要，换场地就用得上）
+!vision/data/calib/
+
+# ---- 编辑器 / 系统 ----
+.idea/
+.DS_Store
+Thumbs.db
+
+# ---- 视频与大文件 ----
+*.mp4
+*.avi
+*.mov

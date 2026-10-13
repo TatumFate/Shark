@@ -1,0 +1,8 @@
+# 视觉工程依赖（Python 3.12）
+numpy
+opencv-python
+pillow
+
+# 后续按需再加（现在不要装，先把基础跑通）
+# onnxruntime        # 部署训练好的字符识别小模型
+# matplotlib         # 画数据曲线
