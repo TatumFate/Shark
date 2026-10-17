@@ -103,7 +103,7 @@ def recognize_crop(bgr, cx, cy, r_px, tpl, side, size=TPL_SIZE, step=None, dilat
     step = step or config.ANGLE_STEP
     angles = list(range(0, 360, step))
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY) if bgr.ndim == 3 else bgr
-    half = max(6, int(r_px * 0.70))
+    half = max(6, int(r_px * config.CHAR_CROP_RATIO))
     patches = []
     for ang in angles:
         M = cv2.getRotationMatrix2D((cx, cy), ang, 1.0)
