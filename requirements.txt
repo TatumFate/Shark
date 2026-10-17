@@ -7,3 +7,4 @@ pillow
 # onnxruntime        # 部署训练好的字符识别小模型
 # matplotlib         # 画数据曲线
 # pyserial           # 接真车时用（串口发指令、读位姿）
+pyserial                # 接真车必需（run_live.py 用）

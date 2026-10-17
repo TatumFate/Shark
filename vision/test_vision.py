@@ -27,6 +27,11 @@ BASE = {"recall": 95.0, "pos_err_mm": 3.0, "char_acc": 70.0, "fps": 20.0}
 
 
 def main():
+    # Windows 的终端默认是 GBK，emoji 会直接抛 UnicodeEncodeError，这里兜底
+    try:
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    except Exception:                          # noqa: BLE001
+        pass
     ap = argparse.ArgumentParser()
     ap.add_argument("--fps-only", action="store_true")
     args = ap.parse_args()
@@ -113,11 +118,11 @@ def main():
 
     print("-" * 62)
     if fails:
-        print("❌ 有指标低于基线：")
+        print("[FAIL] 有指标低于基线：")
         for f in fails:
             print("   ·", f)
         return 1
-    print("✅ 全部达标（查全 ≥95% / 定位 ≤3mm / 字符 ≥70% / 帧率 ≥20FPS）")
+    print("[OK] 全部达标（查全 >=95% / 定位 <=3mm / 字符 >=70% / 帧率 >=20FPS）")
     return 0
 
 

@@ -33,6 +33,7 @@ numpy 的 cp314 轮子是按正式版 ABI 编译的，加载时会报
 | `pipeline.py` | **端到端主入口**：图 → 校正 → 检测 → 识别 → 结果图/JSON/统计 | `python vision/pipeline.py --image <图> --mode gt --compare-gt` |
 | `realtime.py` | **实时识别**：相机/视频 → 车前视窗校正 → 检测 → 带预算识别 → 棋局理解 → 输出 | `python vision/realtime.py --source 0` |
 | `game.py` | **棋局理解层**：区域判定、得分统计、推扫目标聚类、推进规划、串口帧 | `python vision/game.py`（自测） |
+| `test_vision.py` | **一键回归**：查全率/定位误差/字符识别率/实时帧率，低于基线返回非 0 | `python vision/test_vision.py` |
 
 数据目录（都在 `.gitignore` 里，不进仓库；`calib/` 例外，标定结果要入库）：
 
