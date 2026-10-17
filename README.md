@@ -11,28 +11,21 @@ Shark/
 ├─ docs/                硬件参数、测试记录（两个待填模板）
 ├─ requirements.txt     视觉工程依赖
 ├─ .vscode/             VS Code 配置：解释器、调试、推荐扩展、任务
-└─ vision/              视觉工程（当前进度：识别全流程 + 实时 + 棋局理解层已跑通）
-   ├─ README.md         工程说明、脚本用法、当前指标、下一步
-   ├─ config.py         所有可调参数
-   ├─ common.py         单应校正、中文绘制、字形归一化等公共工具
-   ├─ check_env.py      环境自检
-   ├─ capture.py        相机取图
-   ├─ make_synthetic.py 合成测试图（不用相机也能开发）
-   ├─ calib_field.py    地面单应标定
-   ├─ char_templates.py 汉字模板生成
-   ├─ detect_pieces.py  棋子检测 + 红黑判断
-   ├─ recognize_chars.py 汉字识别
-   └─ pipeline.py       端到端主入口
+├─ vision/              视觉工程（识别 + 实时 + 棋局理解，已跑通）
+├─ strategy/            决策层（状态机 + 2D 仿真，已在仿真里跑到 182 分）
+├─ firmware/            STM32 执行层骨架（协议 + 差速 + 里程计，待上板验证）
+└─ vision/README.md     视觉工程说明
 ```
 
-后续还会加入 `firmware/`（STM32 底盘固件）、`docs/`（方案与参赛材料）、
-`mech/`（结构图纸）、`strategy/`（状态机），按需创建。
+各模块的脚本清单和用法见各自的 `README.md`；`mech/`（结构图纸）、
+`tools/`（辅助脚本）按需创建。
 
 ## 从这里开始
 
 1. 先看 [`ROADMAP.md`](ROADMAP.md)：当前该做什么、分支怎么用、目录怎么分。
 2. 填 [`docs/硬件参数.md`](docs/硬件参数.md)：所有代码都依赖这里的数（棋子直径、轮径、相机位姿）。
 3. 把自己的象棋录进系统：见 [`vision/README.md`](vision/README.md) 第十节（20 分钟出真实识别率）。
+4. 没有硬件也想看决策效果：`python strategy/run_sim.py --video`（会录一段仿真比赛视频）。
 
 ## 环境（重要）
 

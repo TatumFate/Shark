@@ -1,0 +1,90 @@
+# strategy · 决策层
+
+把"棋局态势"翻译成"下位机动作"。输入就是 `vision/realtime.py` 里的 `state`，
+输出是一条运动指令（`$GOTO/$TURN/$DRIVE/$BLADE/$STOP`）。
+
+**现在没有车、没有真棋子也能验证**——`sim.py` 提供了一个 2D 仿真底盘，
+和真车走同一套接口。
+
+## 文件
+
+| 文件 | 作用 |
+| --- | --- |
+| `commands.py` | 指令定义 + 串口编码（带校验和，与 `firmware/protocol.c` 一致） |
+| `fsm.py` | 决策状态机（下面那张图） |
+| `sim.py` | 2D 仿真：底盘执行器 / 推板推动 / 计分 / 前视相机仿真 |
+| `run_sim.py` | 跑 N 局，打印得分、趟数、脱困次数，可录视频 |
+
+## 状态机
+
+```
+IDLE ─start→ SEARCH ─有目标→ APPROACH ─到点→ VERIFY ─还在→ ALIGN
+                 ↑                              ↓(目标没了/漂了)
+                 │                              └→ SEARCH
+                 │                                   ALIGN ─摆正→ BLADE_DOWN ─放板→ PUSH
+                 │                                                        ↓
+                 └──── CLEARUP ← RETREAT ← DEPOSIT ←── 推进到位 ─────────┘
+
+APPROACH/PUSH/DEPOSIT 卡住或超时 → RECOVER（放板、倒车、转开、目标冷却 20s）→ SEARCH
+剩余时间不够跑一趟 → DONE（停车）
+```
+
+几个关键设计（都是踩过坑之后才加的）：
+
+| 机制 | 为什么要 |
+| --- | --- |
+| `VERIFY`（到点后复看一次） | 车开过去要 2~3 秒，目标可能被对手撞走/自己看错；不复看就会"对着空气推" |
+| `SEARCH` 扫 3 圈后去堆放区 | 车在角落、棋子在场中间，视野只有 0.8m，不主动过去永远看不见 |
+| 目标冷却（blacklist） | 推失败的目标不能立刻重试，否则会在同一个地方反复卡死 |
+| 卡住检测只看 `DRIVE` | `GOTO` 会先原地转向，用位移判断会把"正在转"误判成"卡住" |
+| 推棋期间暂停记忆登记 | 推的时候棋子一直在动，照常登记会把同一枚记成十几条"幽灵" |
+| 推完清掉扫过的走廊 | 不清的话，下一趟会朝棋子原来的位置去推 |
+
+## 跑仿真
+
+```powershell
+python strategy/run_sim.py                          # 3 局
+python strategy/run_sim.py --episodes 10            # 看稳定性
+python strategy/run_sim.py --video                  # 录到 vision/data/output/sim.mp4
+python strategy/run_sim.py --seconds 60 --noise 8 --dropout 0.2 --char-err 0.2
+```
+
+当前实测（理想化仿真，**是上限值，不代表真实得分**）：
+
+| 条件 | 结果 |
+| --- | --- |
+| 120s × 3 局 | 182 分（32 枚全进），3~6 趟，0 次脱困 |
+| 60s × 2 局 | 182 分（3.5 趟） |
+| 30s × 2 局 | 150.5 分（1.5 趟）——第一趟就能扫走大部分 |
+| 噪声 8mm / 漏检 20% / 字符错 20% | 仍然 182 分 |
+
+为什么仿真这么"好"：没有真实摩擦、棋子不会卡在推板下、没有对手、视觉没有误检、
+底盘是理想追踪。**它的用途是验证决策逻辑对不对，不是预测比赛分数。**
+
+## 接到真车上（三步）
+
+1. **输入**：`realtime.py` 里已经有 `state`（`game.build_state` 的输出）。
+   把 `engine.process(frame)` 返回的 `state` 直接喂给 `fsm.update(...)`。
+2. **输出**：`fsm.update()` 返回的 `Command` 用 `cmd.encode()` 变一行字符串，
+   通过串口发给 STM32（替换掉 `sim.py` 里的 `SimChassis.send`）。
+3. **完成信号**：`action_done` 用下位机回传的 `$P,...,done` 里的 `done`；
+   位姿也用 `$P` 里的 x/y/h。若暂时没有 done 信号，可以先用"位姿到位 + 超时"判断。
+
+`fsm.update(gs, pose, now, action_done, opponent=None, memory=mem)` 的参数：
+
+| 参数 | 说明 |
+| --- | --- |
+| `gs` | `game.build_state()` 的返回值（含 `plans`） |
+| `pose` | 车在场地上的位姿 `(x, y, heading_deg)` |
+| `now` | 秒（单调递增） |
+| `action_done` | 上一条指令是否完成 |
+| `opponent` | 对手车位置 `(x, y)`，可选；用来避开"我要去的对准点" |
+| `memory` | `game.FieldMemory`，用来在推完后清走廊 |
+
+## 已知限制（下一步）
+
+1. **没有路径绕行**：现在只给"对准点+朝向+推进距离"，遇墙/对手靠 `RECOVER` 兜底。
+   3m×2m 场地直线够用，但对手堵路时需要 A* 或简单绕行。
+2. **没有对手博弈**：只做"离对手远一点"，没有"抢它正在推的那堆"。
+3. **不校验投放结果**：推完就默认成功。以后可以用视觉看到球门区棋子数增长来确认。
+4. **仿真乐观**：见上表说明。真车上线后，用 `docs/测试记录.md` 记录真实得分。
