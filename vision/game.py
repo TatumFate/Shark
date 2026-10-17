@@ -223,10 +223,15 @@ def plan_push(cluster, blade_ahead=None):
     cx, cy = cluster["x"], cluster["y"]
     ux, uy = cluster["dir"]
     stand_off = blade + cluster["span_mm"]
+    # 推进距离要算上"簇的跨度"和"棋子半径"：
+    # 车从簇后方 stand_off 处出发，推板把棋子顶在板前（约 r）处，
+    # 所以要把整簇送到球门中心，需要多走 span - r。
+    # （少算这一项的表现就是：棋子停在球门前二三十厘米，白跑一趟。）
+    push = cluster["dist_goal"] + cluster["span_mm"] - config.PIECE_R
     return {
         "aim": [round(cx - ux * stand_off, 1), round(cy - uy * stand_off, 1)],
         "heading_deg": round(math.degrees(math.atan2(uy, ux)), 1),
-        "push_mm": round(cluster["dist_goal"] - config.GOAL_DEPTH / 2.0, 1),
+        "push_mm": round(push, 1),
         "expect_value": cluster["value"],
         "expect_count": cluster["n"],
         "chars": cluster["chars"],
@@ -260,9 +265,12 @@ class FieldMemory:
         self.tol = float(tol_mm or config.MEMORY_TOL_MM)
         self.ttl = float(ttl_s or config.MEMORY_TTL_S)
         self.items = []            # [{x,y,side,char,value,score,t_seen,hits,zone}]
+        self.paused = False        # 推棋子的时候别登记（位置一直在变，会记成一堆重复条目）
 
     def update(self, pieces, now=None):
         """把这一帧看到的棋子并进台账（同色 + 距离近 → 认为是同一枚）。"""
+        if self.paused:
+            return []
         now = time.time() if now is None else now
         added = []
         for p in pieces:
@@ -308,6 +316,27 @@ class FieldMemory:
 
     def clear(self):
         self.items = []
+
+    def forget_segment(self, x0, y0, x1, y1, width_mm=None):
+        """把"刚刚被推扫过的那条走廊"里的记忆清掉。
+
+        为什么必须有：推完一趟，这一片的棋子都被挪走了，但台账里还记着它们原来的位置。
+        不清掉，下一趟会朝着"幽灵位置"去推空气。清掉之后，凡是真的还在的棋子，
+        下一帧被相机看到就会作为新条目重新登记。
+        """
+        width = float(width_mm if width_mm is not None else config.BLADE_WIDTH_MM)
+        ax, ay, bx, by = float(x0), float(y0), float(x1), float(y1)
+        dx, dy = bx - ax, by - ay
+        seg2 = dx * dx + dy * dy or 1e-6
+        keep = []
+        for it in self.items:
+            t = max(0.0, min(1.0, ((it["x"] - ax) * dx + (it["y"] - ay) * dy) / seg2))
+            px, py = ax + t * dx, ay + t * dy
+            if math.hypot(it["x"] - px, it["y"] - py) > width / 2.0:
+                keep.append(it)
+        removed = len(self.items) - len(keep)
+        self.items = keep
+        return removed
 
     def __len__(self):
         return sum(1 for it in self.items if not it.get("gone"))
