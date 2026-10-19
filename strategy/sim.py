@@ -256,12 +256,14 @@ def _start_pose(side):
     return (config.FIELD_L - config.START_L / 2, config.START_W / 2)
 
 
-def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, vision=None):
+def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, vision=None,
+                sides=("red", "black")):
+    """sides 决定跑哪几支队：默认红黑都跑；传 ("red",) 就是只看红队。"""
     seconds = float(seconds or config.MATCH_SECONDS)
     rng = np.random.default_rng(seed)
     world = SimWorld(SimWorld.make_pieces(32, random.Random(seed)), rng)
     cars, mems, fsms, emus = {}, {}, {}, {}
-    for i, side in enumerate(("red", "black")):
+    for i, side in enumerate(sides):
         sx, sy = _start_pose(side)
         tx, ty = config.PILE_CX, config.PILE_CY
         cars[side] = SimChassis(sx, sy, math.degrees(math.atan2(ty - sy, tx - sx)),
@@ -275,27 +277,29 @@ def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, visio
     for step in range(int(seconds / dt)):
         t = step * dt
         if step % vis_every == 0:
-            for side in ("red", "black"):
+            for side in sides:
                 car = cars[side]
-                other = "black" if side == "red" else "red"
+                others = [cars[s] for s in sides if s != side]
                 rp = emus[side].observe(world, car)
                 gs = game.build_state(rp, pose=car.pose(), memory=mems[side], own_side=side)
                 cmd = fsms[side].update(gs, car.pose(), t, car.is_done(),
-                                        opponent=cars[other].pose()[:2], memory=mems[side])
+                                        opponent=(others[0].pose()[:2] if others else None),
+                                        memory=mems[side])
                 car.send(cmd)
-        for side in ("red", "black"):
+        for side in sides:
             cars[side].step(dt)
-        world.update([cars["red"], cars["black"]], t)
+        world.update([cars[s] for s in sides], t)
         if render and step % max(1, int(0.1 / dt)) == 0:
             render(world, cars, fsms, t)
             frames += 1
     return {
-        "score": dict(world.score),
-        "scored": dict(world.scored_count),
+        "score": {s: world.score[s] for s in sides},
+        "scored": {s: world.scored_count[s] for s in sides},
         "seconds": seconds,
         "trips": {s: fsms[s].trips for s in fsms},
         "recoveries": {s: fsms[s].recoveries for s in fsms},
         "states": {s: fsms[s].state for s in fsms},
+        "history": {s: fsms[s].history for s in fsms},
         "events": world.events,
         "frames": frames,
         "pieces": world.pieces,

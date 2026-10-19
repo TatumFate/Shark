@@ -119,19 +119,40 @@ class Renderer:
                 d.line([b0, b1], fill=col, width=5)
             d.text((px(car.x, car.y)[0] - 18, px(car.x, car.y)[1] + 10),
                    "红队" if side == "red" else "黑队", font=font(16), fill=(255, 255, 255))
+        # 当前目标：把这 1~2 枚圈出来，并画出推进方向
+        for side, f in fsms.items():
+            tgt = f.target
+            if not tgt:
+                continue
+            for m in tgt["members"]:
+                cx, cy = px(m["x"], m["y"])
+                rr = int(config.PIECE_R * S * 1.6)
+                d.ellipse([cx - rr, cy - rr, cx + rr, cy + rr],
+                          outline=(255, 210, 0), width=4)   # 黄色圈，红车上也看得见
+            ax, ay = px(tgt["plan"]["aim"][0], tgt["plan"]["aim"][1])
+            bx, by = px(tgt["x"], tgt["y"])
+            d.line([ax, ay, bx, by], fill=TEAM_RGB[side], width=3)
         # HUD
         remain = max(0.0, (self.seconds or config.MATCH_SECONDS) - t)
-        d.text((PAD_X, 14), "智能车光电象棋对抗 · 双队仿真（只能推自己颜色，推错扣分）",
+        solo = "（红队单独演示：只推红棋，一次 1~2 枚）" if len(cars) == 1 else "（只能推自己颜色，推错扣分）"
+        d.text((PAD_X, 14), "智能车光电象棋对抗 · 仿真" + solo,
                font=font(20), fill=(30, 30, 30))
-        d.text((PAD_X, 44), f"红队 {world.score['red']:3d} 分（{world.scored_count['red']} 枚）   "
-                            f"黑队 {world.score['black']:3d} 分（{world.scored_count['black']} 枚）   "
-                            f"剩余 {remain:4.1f}s",
+        parts = []
+        for s in cars:
+            parts.append(f"{'红' if s == 'red' else '黑'}队 {world.score[s]:3d} 分"
+                         f"（{world.scored_count[s]} 枚）")
+        d.text((PAD_X, 44), "   ".join(parts) + f"   剩余 {remain:4.1f}s",
                font=font(22), fill=(20, 20, 20))
         y = 74
-        for side in ("red", "black"):
+        for side in fsms:
             st = fsms[side].status(t)
             d.text((W - 520, y), f"{'红' if side == 'red' else '黑'}: {st['state']}",
                    font=font(15), fill=TEAM_RGB[side])
+            tg = fsms[side].target
+            if tg:
+                txt = f"推{tg['own_n']}枚 净+{tg['net']}"
+                tw = d.textlength(txt, font=font(13))
+                d.text((W - 70 - tw, y), txt, font=font(13), fill=(110, 110, 110))
             y += 24
         if world.events:
             e = world.events[-1]
@@ -154,6 +175,8 @@ def main():
     ap.add_argument("--seconds", type=float, default=None)
     ap.add_argument("--seed", type=int, default=1000)
     ap.add_argument("--video", action="store_true")
+    ap.add_argument("--team", choices=["red", "black", "both"], default="both",
+                    help="跑哪支队：red=只红队（默认给视频用）")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     rows = []
@@ -161,18 +184,21 @@ def main():
     for i in range(args.episodes):
         path = (args.out or str(config.DIR_OUTPUT / "sim.mp4")) if (args.video and i == 0) else None
         rnd = Renderer(path, seconds=args.seconds)
-        r = run_episode(seed=args.seed + i, seconds=args.seconds, render=rnd)
+        sides = ("red",) if args.team == "red" else ("black",) if args.team == "black" else ("red", "black")
+        r = run_episode(seed=args.seed + i, seconds=args.seconds, render=rnd, sides=sides)
         rnd.close()
         rows.append(r)
-        print(f"第 {i + 1} 局：红队 {r['score']['red']:4d} 分（{r['scored']['red']} 枚，"
-              f"{r['trips']['red']} 趟） | 黑队 {r['score']['black']:4d} 分"
-              f"（{r['scored']['black']} 枚，{r['trips']['black']} 趟）"
-              f" | 脱困 红{r['recoveries']['red']}/黑{r['recoveries']['black']}")
+        line = " | ".join(
+            f"{'红' if s == 'red' else '黑'}队 {r['score'][s]:4d} 分"
+            f"（{r['scored'][s]} 枚，{r['trips'][s]} 趟）" for s in r["score"])
+        print(f"第 {i + 1} 局：{line}")
         bad = [e for e in r["events"] if e[4] < 0]
         if bad:
             print("   误推扣分：", "；".join(f"{e[1]}队 {e[3]}方{e[2]} {e[4]}" for e in bad[:5]))
     print("-" * 70)
     for side, name in (("red", "红队"), ("black", "黑队")):
+        if side not in rows[0]["score"]:
+            continue
         sc = [r["score"][side] for r in rows]
         print(f"{name}：平均 {np.mean(sc):.1f} 分，最高 {max(sc)}，最低 {min(sc)}")
     print(f"仿真耗时 {time.perf_counter() - t0:.1f}s")

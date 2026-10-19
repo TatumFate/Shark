@@ -230,6 +230,33 @@ def summarize_cluster(members, own_side=None):
     }
 
 
+def push_candidates(members, max_n=None):
+    """把一簇切成"一次推得动"的小组：单枚 + 相邻两枚（去重）。
+
+    为什么需要：即使聚类半径很小，几个棋子挨成一串也会被连成一大簇。
+    真正推的时候一次只带 1~2 枚，所以要在候选阶段就把大簇拆开，
+    按"净收益/耗时"去挑最划算的 1~2 枚。
+    """
+    max_n = int(max_n or config.TARGET_MAX_PIECES)
+    out = []
+    for p in members:
+        out.append([p])
+        if max_n >= 2:
+            near = sorted([q for q in members if q is not p],
+                          key=lambda q: math.hypot(q["x"] - p["x"], q["y"] - p["y"]))
+            if near:
+                q = near[0]
+                if math.hypot(q["x"] - p["x"], q["y"] - p["y"]) <= config.PIECE_DIA * 2.2:
+                    out.append([p, q])
+    seen, uniq = set(), []
+    for g in out:
+        key = tuple(sorted(id(x) for x in g))
+        if key not in seen:
+            seen.add(key)
+            uniq.append(g)
+    return uniq
+
+
 def plan_push(cluster, blade_ahead=None):
     """给出推这一簇的走法（场地坐标系）。
 
@@ -387,8 +414,10 @@ def plan_from_memory(memory, pose=None, speed_mm_s=None, blade_ahead=None,
     """
     own_side = own_side or config.OWN_SIDE
     # 只聚自己颜色的棋子：规则是"只能推自己一侧"，混着推会把对方棋子也带进门（扣分）
-    clusters = [summarize_cluster(m, own_side)
-                for m in cluster_pieces(memory.snapshot(), cluster_r, sides=own_side)]
+    groups = []
+    for cl in cluster_pieces(memory.snapshot(), cluster_r, sides=own_side):
+        groups.extend(push_candidates(cl, config.TARGET_MAX_PIECES))
+    clusters = [summarize_cluster(m, own_side) for m in groups]
     got = []
     for c in clusters:
         if c["net"] <= 0:                  # 净收益不为正，推了白亏
@@ -450,8 +479,10 @@ def build_state(pieces, pose=None, scoreboard=None, score_mode=None, own_side=No
         ranked = plan_from_memory(memory, pose, blade_ahead=blade_ahead,
                                   cluster_r=cluster_r, own_side=own_side)
     else:
-        ranked = rank_clusters([summarize_cluster(m, own_side)
-                                for m in cluster_pieces(pieces, cluster_r, sides=own_side)])
+        groups = []
+        for cl in cluster_pieces(pieces, cluster_r, sides=own_side):
+            groups.extend(push_candidates(cl, config.TARGET_MAX_PIECES))
+        ranked = rank_clusters([summarize_cluster(m, own_side) for m in groups])
         for c in ranked:
             c["plan"] = plan_push(c, blade_ahead)
     in_view_value, in_view_n = count_value(pieces, score_mode, own_side)
