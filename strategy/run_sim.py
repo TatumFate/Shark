@@ -177,6 +177,8 @@ def main():
     ap.add_argument("--video", action="store_true")
     ap.add_argument("--team", choices=["red", "black", "both"], default="both",
                     help="跑哪支队：red=只红队（默认给视频用）")
+    ap.add_argument("--spread", action="store_true",
+                    help="棋子散布全场（默认：按规则图挤在中央堆放区）")
     ap.add_argument("--out", default=None)
     args = ap.parse_args()
     rows = []
@@ -185,7 +187,8 @@ def main():
         path = (args.out or str(config.DIR_OUTPUT / "sim.mp4")) if (args.video and i == 0) else None
         rnd = Renderer(path, seconds=args.seconds)
         sides = ("red",) if args.team == "red" else ("black",) if args.team == "black" else ("red", "black")
-        r = run_episode(seed=args.seed + i, seconds=args.seconds, render=rnd, sides=sides)
+        r = run_episode(seed=args.seed + i, seconds=args.seconds, render=rnd,
+                        sides=sides, spread=args.spread)
         rnd.close()
         rows.append(r)
         line = " | ".join(

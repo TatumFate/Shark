@@ -404,6 +404,26 @@ def estimate_seconds(cluster, pose=None, speed_mm_s=None):
     return travel + config.ALIGN_SEC + config.TRIP_OVERHEAD_S
 
 
+def corridor_count(items, x0, y0, x1, y1, width=180.0, exclude=None):
+    """统计"从车到对准点"这条走廊里有多少别的棋子。
+
+    为什么要算：真实车开不过去——44mm 的棋子会把车顶歪、拖慢，还会被扒拉散。
+    所以"要横穿一堆棋子才能到对准点"的目标应该降权，优先挑从外侧能够到的。
+    """
+    dx, dy = x1 - x0, y1 - y0
+    l2 = dx * dx + dy * dy or 1e-6
+    ex = exclude or set()
+    n = 0
+    for p in items:
+        if id(p) in ex:
+            continue
+        t = max(0.0, min(1.0, ((p["x"] - x0) * dx + (p["y"] - y0) * dy) / l2))
+        px, py = x0 + t * dx, y0 + t * dy
+        if math.hypot(p["x"] - px, p["y"] - py) <= width / 2.0:
+            n += 1
+    return n
+
+
 def plan_from_memory(memory, pose=None, speed_mm_s=None, blade_ahead=None,
                      cluster_r=None, keep=3, own_side=None):
     """从**整场台账**里挑出"分/秒"最高的一趟，给出规划。
@@ -426,11 +446,25 @@ def plan_from_memory(memory, pose=None, speed_mm_s=None, blade_ahead=None,
         ages = [m.get("age_s", 0) for m in c["members"]]
         age_pen = 1.0 / (1.0 + (sum(ages) / len(ages)) / max(config.MEMORY_TTL_S, 1.0))
         eta = estimate_seconds(c, pose, speed_mm_s)
+        plan = plan_push(c, blade_ahead)
+        blocked, pen = 0, 1.0
+        push_block = 0
+        if pose:
+            ex = {id(m) for m in c["members"]}
+            blocked = corridor_count(memory.snapshot(), pose[0], pose[1],
+                                     plan["aim"][0], plan["aim"][1], 180.0, ex)
+            # 推进通道：从这枚棋子到球门之间有多少别的棋子——有就把它们一起推进门，
+            # 里面多半混着对方颜色（等于白送分给对手、还扣自己的分）。
+            gx, gy = own_goal_center(own_side)
+            push_block = corridor_count(memory.snapshot(), c["x"], c["y"], gx, gy, 160.0, ex)
+            pen = 1.0 / ((1.0 + 0.25 * blocked) * (1.0 + 0.5 * push_block))
         got.append({**c,
                     "eta_s": round(eta, 2),
-                    "rate": round(c["net"] * age_pen / eta, 3),
-                    "priority": round(c["net"] * age_pen / eta, 3),
-                    "plan": plan_push(c, blade_ahead)})
+                    "blocked": blocked,
+                    "push_block": push_block,
+                    "rate": round(c["net"] * age_pen * pen / eta, 3),
+                    "priority": round(c["net"] * age_pen * pen / eta, 3),
+                    "plan": plan})
     got.sort(key=lambda c: -c["rate"])
     return got[:keep]
 

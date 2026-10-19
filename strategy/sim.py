@@ -36,6 +36,7 @@ class SimChassis:
         self.last_cmd = None
         self.blade_down = False
         self.rng = rng or np.random.default_rng(0)
+        self.obstruct = 0.0          # 0~0.6：车体压到棋子时降速用
 
     def pose(self):
         return (self.x, self.y, wrap_deg(self.h))
@@ -94,6 +95,7 @@ class SimChassis:
                 w = max(-self.w_max, min(self.w_max, err * 2.5))
                 self.h = wrap_deg(self.h + w * dt)
                 v = min(self.v_max, max(120.0, dist * 3.5)) * max(0.25, 1.0 - abs(err) / 120.0)
+                v *= (1.0 - self.obstruct)
                 step = min(v * dt, dist)
                 self.x += math.cos(math.radians(self.h)) * step
                 self.y += math.sin(math.radians(self.h)) * step
@@ -109,7 +111,7 @@ class SimChassis:
             if abs(left) < 10.0:
                 self.task = None
                 return
-            v = min(self.v_max, max(200.0, abs(left) * 4.0))
+            v = min(self.v_max, max(200.0, abs(left) * 4.0)) * (1.0 - self.obstruct)
             step = math.copysign(min(v * dt, abs(left)), left)
             self.x += math.cos(math.radians(self.h)) * step
             self.y += math.sin(math.radians(self.h)) * step
@@ -132,7 +134,7 @@ class SimWorld:
         self.events = []          # (时间标签, 队伍, 棋子, 得分)
 
     @staticmethod
-    def make_pieces(n=32, rng=None):
+    def make_pieces(n=32, rng=None, spread=False):
         rng = rng or random.Random(0)
         spec = {
             "red": [("帅", 1), ("仕", 2), ("相", 2), ("车", 2), ("马", 2), ("炮", 2), ("兵", 5)],
@@ -146,13 +148,18 @@ class SimWorld:
                                 "value": config.VALUE.get(config.NORMALIZE.get(ch, ch), 0)})
         out = out[:n]
         placed = []
+        min_d = config.PIECE_DIA * (3.4 if spread else 1.1)
         for p in out:
-            for _ in range(4000):
-                x = rng.uniform(config.PILE_CX - config.PILE_L / 2 + config.PIECE_R,
-                                config.PILE_CX + config.PILE_L / 2 - config.PIECE_R)
-                y = rng.uniform(config.PILE_CY - config.PILE_W / 2 + config.PIECE_R,
-                                config.PILE_CY + config.PILE_W / 2 - config.PIECE_R)
-                if all(math.hypot(x - q["x"], y - q["y"]) > config.PIECE_DIA * 1.1 for q in placed):
+            for _ in range(8000):
+                if spread:
+                    x = rng.uniform(420.0, config.FIELD_L - 420.0)
+                    y = rng.uniform(320.0, config.FIELD_W - 320.0)
+                else:
+                    x = rng.uniform(config.PILE_CX - config.PILE_L / 2 + config.PIECE_R,
+                                    config.PILE_CX + config.PILE_L / 2 - config.PIECE_R)
+                    y = rng.uniform(config.PILE_CY - config.PILE_W / 2 + config.PIECE_R,
+                                    config.PILE_CY + config.PILE_W / 2 - config.PIECE_R)
+                if all(math.hypot(x - q["x"], y - q["y"]) > min_d for q in placed):
                     placed.append({**p, "x": x, "y": y, "r": config.PIECE_R, "scored": False})
                     break
         return placed
@@ -189,8 +196,47 @@ class SimWorld:
             p["x"] = car.x + f[0] * new_along + l[0] * (lat + slide)
             p["y"] = car.y + f[1] * new_along + l[1] * (lat + slide)
 
+    def _collide(self, car):
+        """车体压到棋子：把棋子挤到最近的车体边外，并让车被顶偏、降速。
+
+        这是之前仿真漏掉的一环。真实车离地只有约 10mm，而棋子有 10~20mm 厚、44mm 直径：
+        车开过去时棋子不会消失，而是被车轮/底盘挤到旁边，同时把车顶歪、拖慢。
+        所以"直接穿过棋堆再开始推"在现实里是不成立的——会一路把棋子扒拉散。
+        """
+        th = math.radians(car.h)
+        c, s = math.cos(th), math.sin(th)
+        hl, hw = config.BODY_L_MM / 2.0, config.BODY_W_MM / 2.0
+        hit = 0
+        for p in self.pieces:
+            if p["scored"]:
+                continue
+            dx, dy = p["x"] - car.x, p["y"] - car.y
+            along = c * dx + s * dy
+            lat = -s * dx + c * dy
+            if abs(along) > hl + p["r"] or abs(lat) > hw + p["r"]:
+                continue
+            hit += 1
+            need_lat = (hw + p["r"] + 2.0) - abs(lat)
+            need_along = (hl + p["r"] + 2.0) - abs(along)
+            if need_lat <= need_along:
+                lat2 = math.copysign(hw + p["r"] + 2.0, lat if lat != 0 else 1.0)
+                p["x"] = car.x + c * along - s * lat2
+                p["y"] = car.y + s * along + c * lat2
+            else:
+                along2 = math.copysign(hl + p["r"] + 2.0, along if along != 0 else 1.0)
+                p["x"] = car.x + c * along2 - s * lat
+                p["y"] = car.y + s * along2 + c * lat
+        if hit:
+            car.x += float(self.rng.normal(0, 0.9 * hit))
+            car.y += float(self.rng.normal(0, 0.9 * hit))
+            car.h += float(self.rng.normal(0, 0.4 * hit))
+            car.obstruct = min(0.6, 0.12 * hit)      # 压到的棋子越多越慢
+        else:
+            car.obstruct = 0.0
+
     def update(self, cars, t=0.0):
         for car in cars:
+            self._collide(car)
             self._push(car)
         for p in self.pieces:
             if p["scored"]:
@@ -257,11 +303,11 @@ def _start_pose(side):
 
 
 def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, vision=None,
-                sides=("red", "black")):
+                sides=("red", "black"), spread=False):
     """sides 决定跑哪几支队：默认红黑都跑；传 ("red",) 就是只看红队。"""
     seconds = float(seconds or config.MATCH_SECONDS)
     rng = np.random.default_rng(seed)
-    world = SimWorld(SimWorld.make_pieces(32, random.Random(seed)), rng)
+    world = SimWorld(SimWorld.make_pieces(32, random.Random(seed), spread=spread), rng)
     cars, mems, fsms, emus = {}, {}, {}, {}
     for i, side in enumerate(sides):
         sx, sy = _start_pose(side)
