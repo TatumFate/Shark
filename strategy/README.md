@@ -8,7 +8,8 @@
 | 只能推自己颜色 | 聚类时 `sides=own_side` 过滤，别人颜色的棋子不参与目标 |
 | 己方颜色进己方门 → 加分 | `+分值` |
 | 对方颜色进己方门 → 扣分 | `-分值 × config.PENALTY_FACTOR`（默认 1.0；细则没定，先按等值扣） |
-| 一次推几枚未定 | 决策按"净收益 ÷ 耗时"排序，一簇里有几枚就推几枚 |
+| 一次推 1~2 枚 | `TARGET_MAX_PIECES = 2`；大簇会被切成"单枚/相邻两枚"的候选，再按净收益/耗时挑 |
+| 推头宽度 | `BLADE_WIDTH_MM = 120`（约 2.7 个棋子宽），保证一次只带 1~2 枚 |
 
 **净收益** = 己方分值 − 对方分值 × 扣分系数。净收益 ≤ 0 的簇直接丢掉——推了白亏。
 
@@ -63,10 +64,9 @@ APPROACH/PUSH/DEPOSIT 卡住或超时 → RECOVER（放板、倒车、转开、�
 ## 跑仿真
 
 ```powershell
-python strategy/run_sim.py                          # 3 局
+python strategy/run_sim.py                          # 3 局（红黑同时跑）
+python strategy/run_sim.py --team red --video       # 只演示红队，录到 vision/data/output/sim.mp4
 python strategy/run_sim.py --episodes 10            # 看稳定性
-python strategy/run_sim.py --video                  # 录到 vision/data/output/sim.mp4
-python strategy/run_sim.py --seconds 60 --noise 8 --dropout 0.2 --char-err 0.2
 ```
 
 当前实测（理想化仿真，**是上限值，不代表真实得分**）：
