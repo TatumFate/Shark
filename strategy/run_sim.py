@@ -56,7 +56,7 @@ def piece_tile(char, side, dia_px):
 
 
 class Renderer:
-    def __init__(self, out_path=None, fps=10, seconds=None):
+    def __init__(self, out_path=None, fps=10, seconds=None, title=None):
         self.out = None
         if out_path:
             path = Path(out_path)
@@ -68,6 +68,7 @@ class Renderer:
         self.tiles = {}
         self.seconds = seconds
         self.frames = 0
+        self.title = title
 
     def tile(self, char, side):
         key = (char, side)
@@ -134,8 +135,9 @@ class Renderer:
             d.line([ax, ay, bx, by], fill=TEAM_RGB[side], width=3)
         # HUD
         remain = max(0.0, (self.seconds or config.MATCH_SECONDS) - t)
-        solo = "（红队单独演示：只推红棋，一次 1~2 枚）" if len(cars) == 1 else "（只能推自己颜色，推错扣分）"
-        d.text((PAD_X, 14), "智能车光电象棋对抗 · 仿真" + solo,
+        solo = self.title or ("（红队单独演示：只推红棋，一次 1~2 枚）" if len(cars) == 1
+                              else "（只能推自己颜色，推错扣分）")
+        d.text((PAD_X, 14), "智能车光电象棋对抗 · " + solo,
                font=font(20), fill=(30, 30, 30))
         parts = []
         for s in cars:
