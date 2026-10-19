@@ -37,6 +37,7 @@ class SimChassis:
         self.blade_down = False
         self.rng = rng or np.random.default_rng(0)
         self.obstruct = 0.0          # 0~0.6：车体压到棋子时降速用
+        self.arrive_err = None       # 上一次 GOTO 结束时离目标还差多少（调试用）
 
     def pose(self):
         return (self.x, self.y, wrap_deg(self.h))
@@ -46,7 +47,9 @@ class SimChassis:
 
     def send(self, cmd):
         s = str(cmd)
-        if s == self.last_cmd:
+        # 只在"任务正在执行"时去重；任务已完成（task is None）时，同一条指令
+        # 也要重新接受——否则"回到起点再发同样的 GOTO"会被忽略，车以为已经到了。
+        if s == self.last_cmd and self.task is not None:
             return
         self.last_cmd = s
         v = cmd.verb
@@ -102,6 +105,7 @@ class SimChassis:
             else:
                 err = wrap_deg(t["h"] - self.h)
                 if abs(err) < 3.0:
+                    self.arrive_err = math.hypot(t["x"] - self.x, t["y"] - self.y)
                     self.task = None
                     return
                 w = max(-self.w_max, min(self.w_max, err * 3.0))
@@ -187,14 +191,18 @@ class SimWorld:
             lat = dx * l[0] + dy * l[1]
             if not car.blade_down or not (0.0 < along < config.BLADE_AHEAD_MM + p["r"] + 12.0):
                 continue
-            if abs(lat) >= half_w - p["r"] * 0.2:
+            # 侧挡边：棋子必须能进铲口；进去之后被两侧挡边夹住
+            mouth = half_w - config.GUIDE_MM - p["r"] * 0.2
+            if abs(lat) > mouth:
                 continue
             new_along = config.BLADE_AHEAD_MM + p["r"] + 3.0
             slide = 0.0
-            if self.rng.random() < 0.12:
+            if config.GUIDE_MM <= 0 and self.rng.random() < 0.12:
                 slide = math.copysign(4.0, lat if lat != 0 else 1.0)
-            p["x"] = car.x + f[0] * new_along + l[0] * (lat + slide)
-            p["y"] = car.y + f[1] * new_along + l[1] * (lat + slide)
+            lat_c = max(-mouth, min(mouth, lat + slide))
+            p["x"] = car.x + f[0] * new_along + l[0] * lat_c
+            p["y"] = car.y + f[1] * new_along + l[1] * lat_c
+            p["pushed"] = p.get("pushed", 0) + 1
 
     def _collide(self, car):
         """车体压到棋子：把棋子挤到最近的车体边外，并让车被顶偏、降速。
@@ -303,7 +311,7 @@ def _start_pose(side):
 
 
 def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, vision=None,
-                sides=("red", "black"), spread=False):
+                sides=("red", "black"), spread=False, debug=False):
     """sides 决定跑哪几支队：默认红黑都跑；传 ("red",) 就是只看红队。"""
     seconds = float(seconds or config.MATCH_SECONDS)
     rng = np.random.default_rng(seed)
@@ -320,6 +328,7 @@ def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, visio
         emus[side] = VisionEmu(rng=np.random.default_rng(seed + 20 + i), **(vision or {}))
     vis_every = max(1, int(round(1.0 / (vision_hz * dt))))
     frames = 0
+    push_log = []
     for step in range(int(seconds / dt)):
         t = step * dt
         if step % vis_every == 0:
@@ -328,9 +337,24 @@ def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, visio
                 others = [cars[s] for s in sides if s != side]
                 rp = emus[side].observe(world, car)
                 gs = game.build_state(rp, pose=car.pose(), memory=mems[side], own_side=side)
+                prev = fsms[side].state
                 cmd = fsms[side].update(gs, car.pose(), t, car.is_done(),
                                         opponent=(others[0].pose()[:2] if others else None),
                                         memory=mems[side])
+                if debug and fsms[side].state == "PUSH" and prev != "PUSH":
+                    th = math.radians(car.h)
+                    cc, ss = math.cos(th), math.sin(th)
+                    tgt = fsms[side].target or {}
+                    best = []
+                    for m in tgt.get("members", []):
+                        dx, dy = m["x"] - car.x, m["y"] - car.y
+                        best.append((round(cc * dx + ss * dy), round(-ss * dx + cc * dy),
+                                     m["char"]))
+                    push_log.append((round(t, 1), round(car.x), round(car.y),
+                                     round(car.h),
+                                     None if car.arrive_err is None else round(car.arrive_err),
+                                     best, round((tgt.get("plan") or {}).get("push_mm", 0)),
+                                     car.blade_down))
                 car.send(cmd)
         for side in sides:
             cars[side].step(dt)
@@ -349,4 +373,5 @@ def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, visio
         "events": world.events,
         "frames": frames,
         "pieces": world.pieces,
+        "push_log": push_log,
     }

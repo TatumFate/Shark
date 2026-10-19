@@ -266,12 +266,13 @@ def plan_push(cluster, blade_ahead=None):
     blade = float(blade_ahead if blade_ahead is not None else config.BLADE_AHEAD_MM)
     cx, cy = cluster["x"], cluster["y"]
     ux, uy = cluster["dir"]
-    stand_off = blade + cluster["span_mm"]
+    stand_off = blade + cluster["span_mm"] + config.APPROACH_MARGIN_MM
     # 推进距离要算上"簇的跨度"和"棋子半径"：
     # 车从簇后方 stand_off 处出发，推板把棋子顶在板前（约 r）处，
     # 所以要把整簇送到球门中心，需要多走 span - r。
     # （少算这一项的表现就是：棋子停在球门前二三十厘米，白跑一趟。）
-    push = cluster["dist_goal"] + cluster["span_mm"] - config.PIECE_R
+    push = (cluster["dist_goal"] + cluster["span_mm"] - config.PIECE_R
+            + config.APPROACH_MARGIN_MM)
     return {
         "aim": [round(cx - ux * stand_off, 1), round(cy - uy * stand_off, 1)],
         "heading_deg": round(math.degrees(math.atan2(uy, ux)), 1),
@@ -510,13 +511,15 @@ def build_state(pieces, pose=None, scoreboard=None, score_mode=None, own_side=No
     pieces = annotate_zones(to_field_frame(pieces, pose), own_side)
     if memory is not None:
         memory.update(pieces)
+        # keep 给大一点：决策层要靠它"到点复看"，只留前 3 个会把目标挤出去、
+        # 误判成"目标不在了"（这个 bug 在 trace 里表现为反复重选）。
         ranked = plan_from_memory(memory, pose, blade_ahead=blade_ahead,
-                                  cluster_r=cluster_r, own_side=own_side)
+                                  cluster_r=cluster_r, own_side=own_side, keep=12)
     else:
         groups = []
         for cl in cluster_pieces(pieces, cluster_r, sides=own_side):
             groups.extend(push_candidates(cl, config.TARGET_MAX_PIECES))
-        ranked = rank_clusters([summarize_cluster(m, own_side) for m in groups])
+        ranked = rank_clusters([summarize_cluster(m, own_side) for m in groups], keep=12)
         for c in ranked:
             c["plan"] = plan_push(c, blade_ahead)
     in_view_value, in_view_n = count_value(pieces, score_mode, own_side)
