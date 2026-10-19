@@ -40,26 +40,27 @@ def to_field_frame(pieces, pose=None):
 
 
 # ------------------------------------------------------------------ 区域
-def own_goal_box():
-    """己方球门区（甲队=左墙长条；本队是乙队时自动镜像）。"""
-    if config.PLAYER_NAME == "甲队":
+def own_goal_box(side=None):
+    """己方球门区。红队守左门、黑队守右门（映射在 config.SIDE_GOAL，抽签相反就改它）。"""
+    side = side or config.OWN_SIDE
+    if config.SIDE_GOAL.get(side, "left") == "left":
         return (0.0, config.GOAL_DEPTH, config.GOAL_Y0, config.GOAL_Y1)
     return (config.FIELD_L - config.GOAL_DEPTH, config.FIELD_L, config.GOAL_Y0, config.GOAL_Y1)
 
 
-def rival_goal_box():
-    x0, x1, y0, y1 = own_goal_box()
+def rival_goal_box(side=None):
+    x0, x1, y0, y1 = own_goal_box(side)
     return (config.FIELD_L - x1, config.FIELD_L - x0, y0, y1)
 
 
-def own_goal_center():
-    x0, x1, y0, y1 = own_goal_box()
+def own_goal_center(side=None):
+    x0, x1, y0, y1 = own_goal_box(side)
     return ((x0 + x1) / 2.0, (y0 + y1) / 2.0)
 
 
-def classify_zone(x, y):
+def classify_zone(x, y, side=None):
     """返回棋子所在区域：own_goal / rival_goal / pile / field。"""
-    for name, box in (("own_goal", own_goal_box()), ("rival_goal", rival_goal_box())):
+    for name, box in (("own_goal", own_goal_box(side)), ("rival_goal", rival_goal_box(side))):
         x0, x1, y0, y1 = box
         if x0 <= x <= x1 and y0 <= y <= y1:
             return name
@@ -74,10 +75,10 @@ def label_zone(z):
             "pile": "棋子堆放区", "field": "对抗区"}.get(z, z)
 
 
-def annotate_zones(pieces):
+def annotate_zones(pieces, side=None):
     out = []
     for p in pieces:
-        z = classify_zone(p["x"], p["y"])
+        z = classify_zone(p["x"], p["y"], side)
         out.append({**p, "zone": z, "zone_cn": label_zone(z)})
     return out
 
@@ -160,13 +161,17 @@ class GoalCounter:
 
 
 # ------------------------------------------------------------------ 聚类：找"一铲能带走的一堆"
-def cluster_pieces(pieces, radius=None):
+def cluster_pieces(pieces, radius=None, sides=None):
     """把已识别的棋子按距离聚类（并查集，单链式），返回每簇的成员列表。
 
     只对"已认出字"的棋子聚类：字都没认出来，就不知道值不值得推。
+    sides：只对这些颜色聚类（例如只聚自己颜色的棋子）。
     """
     radius = float(radius or config.CLUSTER_R)
     items = [p for p in pieces if p.get("char")]
+    if sides:
+        sides = set([sides] if isinstance(sides, str) else sides)
+        items = [p for p in items if p.get("side") in sides]
     n = len(items)
     parent = list(range(n))
 
@@ -189,20 +194,32 @@ def cluster_pieces(pieces, radius=None):
     return list(groups.values())
 
 
-def summarize_cluster(members):
-    """算一簇的合计分值、中心、推进方向、到球门区的距离。"""
+def summarize_cluster(members, own_side=None):
+    """算一簇的合计分值、中心、推进方向、到球门区的距离。
+
+    还会算"净收益"：己方颜色进己方门是加分，对方颜色进去要扣分，所以
+    净收益 = 己方分值 - 对方分值 × PENALTY_FACTOR。决策按净收益排，不按总分。
+    """
     xs = [p["x"] for p in members]
     ys = [p["y"] for p in members]
     cx, cy = sum(xs) / len(xs), sum(ys) / len(ys)
-    gx, gy = own_goal_center()
+    own_side = own_side or config.OWN_SIDE
+    gx, gy = own_goal_center(own_side)
     dx, dy = gx - cx, gy - cy
     dist = math.hypot(dx, dy) or 1e-6
     ux, uy = dx / dist, dy / dist          # 推进方向：从簇中心指向己方球门区
     ext = max(abs((p["x"] - cx) * ux + (p["y"] - cy) * uy) for p in members)
     n_red = sum(1 for p in members if p["side"] == "red")
+    own_v = sum(p.get("value", 0) for p in members if p["side"] == own_side)
+    opp_v = sum(p.get("value", 0) for p in members if p["side"] != own_side)
+    own_n = sum(1 for p in members if p["side"] == own_side)
     return {
         "n": len(members),
         "value": sum(p.get("value", 0) for p in members),
+        "own_value": own_v, "opp_value": opp_v,
+        "own_n": own_n, "opp_n": len(members) - own_n,
+        "net": round(own_v - opp_v * config.PENALTY_FACTOR, 1),
+        "own_side": own_side,
         "x": round(cx, 1), "y": round(cy, 1),
         "red_ratio": round(n_red / len(members), 2),
         "span_mm": round(ext, 1),
@@ -239,11 +256,14 @@ def plan_push(cluster, blade_ahead=None):
 
 
 def rank_clusters(clusters, keep=3):
-    """按性价比排序：分值高、距离近、别太散的优先。"""
+    """按性价比排序：净收益高、距离近、别太散的优先（净收益<=0 的直接丢掉）。"""
     got = []
     for c in clusters:
+        net = float(c.get("net", c["value"]))
+        if net <= 0:
+            continue
         cost = c["dist_goal"] / 1000.0 + 0.35 * c["span_mm"] / 1000.0
-        got.append({**c, "priority": round(c["value"] / (0.6 + cost), 2)})
+        got.append({**c, "priority": round(net / (0.6 + cost), 2)})
     return sorted(got, key=lambda c: -c["priority"])[:keep]
 
 
@@ -358,24 +378,29 @@ def estimate_seconds(cluster, pose=None, speed_mm_s=None):
 
 
 def plan_from_memory(memory, pose=None, speed_mm_s=None, blade_ahead=None,
-                     cluster_r=None, keep=3):
+                     cluster_r=None, keep=3, own_side=None):
     """从**整场台账**里挑出"分/秒"最高的一趟，给出规划。
 
     这直接回答了"先拿分高的还是先拿最近的"：都不是。
     该看的是得分效率 = 这一趟的总分 ÷ 这一趟花的时间，
     其中时间 = 开过去 + 推进球门区 + 对准与开销。
     """
-    clusters = [summarize_cluster(m) for m in cluster_pieces(memory.snapshot(), cluster_r)]
+    own_side = own_side or config.OWN_SIDE
+    # 只聚自己颜色的棋子：规则是"只能推自己一侧"，混着推会把对方棋子也带进门（扣分）
+    clusters = [summarize_cluster(m, own_side)
+                for m in cluster_pieces(memory.snapshot(), cluster_r, sides=own_side)]
     got = []
     for c in clusters:
+        if c["net"] <= 0:                  # 净收益不为正，推了白亏
+            continue
         # 记忆里越久没看到的越可能已经被撞走，轻微降权
         ages = [m.get("age_s", 0) for m in c["members"]]
         age_pen = 1.0 / (1.0 + (sum(ages) / len(ages)) / max(config.MEMORY_TTL_S, 1.0))
         eta = estimate_seconds(c, pose, speed_mm_s)
         got.append({**c,
                     "eta_s": round(eta, 2),
-                    "rate": round(c["value"] * age_pen / eta, 3),
-                    "priority": round(c["value"] * age_pen / eta, 3),
+                    "rate": round(c["net"] * age_pen / eta, 3),
+                    "priority": round(c["net"] * age_pen / eta, 3),
                     "plan": plan_push(c, blade_ahead)})
     got.sort(key=lambda c: -c["rate"])
     return got[:keep]
@@ -406,7 +431,8 @@ def brief(state):
     p = plans[0]
     eta = f"，预计 {p['eta_s']:.1f}s（{p['rate']:.1f} 分/秒）" if p.get("eta_s") else ""
     mem = f"记忆 {state['n_memory']} 枚 / " if state.get("n_memory") is not None else ""
-    return (f"{mem}推荐：推 {p['n']} 枚（{''.join(p['chars'])}）合计 {p['value']} 分 "
+    mix = f"（己方 {p['own_n']}/对方 {p['opp_n']}）" if "own_n" in p else ""
+    return (f"{mem}推荐：推 {p['n']} 枚{mix} 净 +{p.get('net', p['value'])} 分 "
             f"→ 朝向 {p['plan']['heading_deg']:.0f}°，推进 {p['plan']['push_mm'] / 1000:.2f}m"
             f"{eta}")
 
@@ -417,13 +443,15 @@ def build_state(pieces, pose=None, scoreboard=None, score_mode=None, own_side=No
 
     pieces 每枚应含 x, y, side, char, value（recognize_chars 的输出即满足）。
     """
-    pieces = annotate_zones(to_field_frame(pieces, pose))
+    own_side = own_side or config.OWN_SIDE
+    pieces = annotate_zones(to_field_frame(pieces, pose), own_side)
     if memory is not None:
         memory.update(pieces)
-        ranked = plan_from_memory(memory, pose, blade_ahead=blade_ahead, cluster_r=cluster_r)
+        ranked = plan_from_memory(memory, pose, blade_ahead=blade_ahead,
+                                  cluster_r=cluster_r, own_side=own_side)
     else:
-        ranked = rank_clusters([summarize_cluster(m)
-                                for m in cluster_pieces(pieces, cluster_r)])
+        ranked = rank_clusters([summarize_cluster(m, own_side)
+                                for m in cluster_pieces(pieces, cluster_r, sides=own_side)])
         for c in ranked:
             c["plan"] = plan_push(c, blade_ahead)
     in_view_value, in_view_n = count_value(pieces, score_mode, own_side)

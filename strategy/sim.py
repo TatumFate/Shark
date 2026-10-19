@@ -1,12 +1,11 @@
 # -*- coding: utf-8 -*-
-"""2D 仿真：车 + 棋子 + 推板 + 球门区，用来在没有硬件时验证决策层。
+"""2D 仿真（双队版）：红队 vs 黑队，用真棋子图形，按"只能推自己颜色"计分。
 
-仿真里的分工和真实系统一一对应：
-    真实：realtime.py(视觉) → game.build_state(态势) → fsm.py(决策) → 串口 → firmware(执行)
-    仿真：VisionEmu(视觉)      → game.build_state         → fsm.py      → SimChassis(执行)
-
-所以现在没有底盘、没有真棋子，也能把"选目标 → 开过去 → 对准 → 推 → 投放 → 撤离"
-整条决策链跑通、量出得分和用时；等底盘好了，只需把 SimChassis 换成串口发送。
+规则（按你们确认的版本）：
+  · 红队守左门、黑队守右门（config.SIDE_GOAL）
+  · 己方颜色进己方球门 → +分值
+  · 对方颜色进己方球门 → -分值 × PENALTY_FACTOR（推错扣分）
+  · 一次推一枚还是多枚未定 → 决策按"净收益/耗时"选，推多枚会自然出现
 """
 import math
 import random
@@ -27,11 +26,7 @@ def wrap_deg(a):
 
 
 class SimChassis:
-    """模拟下位机：执行 GOTO / TURN / DRIVE / BLADE / STOP。
-
-    GOTO 拆成三段（和固件里的实现保持一致）：转向目标点 → 直走 → 摆正到指定朝向。
-    指令是幂等的：重复收到同一条指令不会把任务重新开始（真实串口也要求这样）。
-    """
+    """模拟下位机：执行 GOTO / TURN / DRIVE / BLADE / STOP（和固件行为对齐）。"""
 
     def __init__(self, x, y, heading_deg, v_max=None, w_max=110.0, rng=None):
         self.x, self.y, self.h = float(x), float(y), float(heading_deg)
@@ -41,9 +36,7 @@ class SimChassis:
         self.last_cmd = None
         self.blade_down = False
         self.rng = rng or np.random.default_rng(0)
-        self.odo = 0.0                      # 累计里程(mm)，用于卡住检测
 
-    # ---- 接口
     def pose(self):
         return (self.x, self.y, wrap_deg(self.h))
 
@@ -52,7 +45,7 @@ class SimChassis:
 
     def send(self, cmd):
         s = str(cmd)
-        if s == self.last_cmd:              # 幂等：同一条指令不重启任务
+        if s == self.last_cmd:
             return
         self.last_cmd = s
         v = cmd.verb
@@ -67,24 +60,20 @@ class SimChassis:
         elif v == "BLADE":
             self.blade_down = bool(cmd.args[0])
             self.task = None
-        elif v == "STOP":
-            self.task = None
-        elif v == "IDLE":
+        elif v in ("STOP", "IDLE"):
             self.task = None
 
-    # ---- 一步积分
     def step(self, dt):
         if self.task is None:
             return
         t = self.task
         if t["type"] == "turn":
             err = wrap_deg(t["h"] - self.h)
-            w = max(-self.w_max, min(self.w_max, err * 3.0))
             if abs(err) < 3.0:
                 self.task = None
                 return
-            self.h = wrap_deg(self.h + w * dt)
-            self.h += float(self.rng.normal(0, 0.03))
+            w = max(-self.w_max, min(self.w_max, err * 3.0))
+            self.h = wrap_deg(self.h + w * dt) + float(self.rng.normal(0, 0.03))
         elif t["type"] == "goto":
             if t["phase"] == "turn":
                 bearing = math.degrees(math.atan2(t["y"] - self.y, t["x"] - self.x))
@@ -100,19 +89,15 @@ class SimChassis:
                 if dist < 25.0:
                     t["phase"] = "align"
                     return
-                # 关键：直行段也要持续修正航向（纯追踪）。
-                # 否则一冲过目标点，就会沿着原航向一路开到墙角、再也回不来。
                 bearing = math.degrees(math.atan2(dy, dx))
                 err = wrap_deg(bearing - self.h)
                 w = max(-self.w_max, min(self.w_max, err * 2.5))
                 self.h = wrap_deg(self.h + w * dt)
-                v = min(self.v_max, max(120.0, dist * 3.5))
-                v *= max(0.25, 1.0 - abs(err) / 120.0)      # 航向偏差大就减速
+                v = min(self.v_max, max(120.0, dist * 3.5)) * max(0.25, 1.0 - abs(err) / 120.0)
                 step = min(v * dt, dist)
                 self.x += math.cos(math.radians(self.h)) * step
                 self.y += math.sin(math.radians(self.h)) * step
-                self.odo += step
-            else:                            # 到点后摆正
+            else:
                 err = wrap_deg(t["h"] - self.h)
                 if abs(err) < 3.0:
                     self.task = None
@@ -129,8 +114,6 @@ class SimChassis:
             self.x += math.cos(math.radians(self.h)) * step
             self.y += math.sin(math.radians(self.h)) * step
             t["left"] -= step
-            self.odo += abs(step)
-        # 位置噪声 + 场地边界
         if self.task is not None:
             self.x += float(self.rng.normal(0, 0.6))
             self.y += float(self.rng.normal(0, 0.6))
@@ -139,23 +122,25 @@ class SimChassis:
 
 
 class SimWorld:
-    """棋子 + 推板推动 + 计分。"""
+    """棋子 + 双方推板 + 计分（含推错扣分）。"""
 
     def __init__(self, pieces, rng=None):
         self.pieces = pieces
         self.rng = rng or np.random.default_rng(1)
-        self.scored = []            # 已进区并冻结的棋子
-        self.push_count = 0
+        self.score = {"red": 0, "black": 0}
+        self.scored_count = {"red": 0, "black": 0}
+        self.events = []          # (时间标签, 队伍, 棋子, 得分)
 
     @staticmethod
     def make_pieces(n=32, rng=None):
-        """在堆放区随机撒 n 枚棋子（不重叠），红黑各一半，分值按 config.VALUE。"""
         rng = rng or random.Random(0)
-        chars_red = [("帅", 1), ("仕", 2), ("相", 2), ("车", 2), ("马", 2), ("炮", 2), ("兵", 5)]
-        chars_blk = [("将", 1), ("士", 2), ("象", 2), ("车", 2), ("马", 2), ("炮", 2), ("卒", 5)]
+        spec = {
+            "red": [("帅", 1), ("仕", 2), ("相", 2), ("车", 2), ("马", 2), ("炮", 2), ("兵", 5)],
+            "black": [("将", 1), ("士", 2), ("象", 2), ("车", 2), ("马", 2), ("炮", 2), ("卒", 5)],
+        }
         out = []
-        for side, spec in (("red", chars_red), ("black", chars_blk)):
-            for ch, k in spec:
+        for side in ("red", "black"):
+            for ch, k in spec[side]:
                 for _ in range(k):
                     out.append({"side": side, "char": ch,
                                 "value": config.VALUE.get(config.NORMALIZE.get(ch, ch), 0)})
@@ -172,8 +157,18 @@ class SimWorld:
                     break
         return placed
 
-    def update(self, car):
-        """推板推动 + 边界 + 计分。"""
+    @staticmethod
+    def goal_of(p):
+        """棋子整体进入哪个门：'left' / 'right' / None。"""
+        for name, (x0, x1, y0, y1) in (("left", (0.0, config.GOAL_DEPTH, config.GOAL_Y0, config.GOAL_Y1)),
+                                       ("right", (config.FIELD_L - config.GOAL_DEPTH, config.FIELD_L,
+                                                  config.GOAL_Y0, config.GOAL_Y1))):
+            if (p["x"] - p["r"] >= x0 - 0.5 and p["x"] + p["r"] <= x1
+                    and p["y"] - p["r"] >= y0 and p["y"] + p["r"] <= y1):
+                return name
+        return None
+
+    def _push(self, car):
         f = (math.cos(math.radians(car.h)), math.sin(math.radians(car.h)))
         l = (-f[1], f[0])
         half_w = config.BLADE_WIDTH_MM / 2.0
@@ -183,33 +178,42 @@ class SimWorld:
             dx, dy = p["x"] - car.x, p["y"] - car.y
             along = dx * f[0] + dy * f[1]
             lat = dx * l[0] + dy * l[1]
-            if car.blade_down and 0.0 < along < config.BLADE_AHEAD_MM + p["r"] + 12.0 \
-                    and abs(lat) < half_w - p["r"] * 0.2:
-                # 被推：保持在推板前方（前后沿齐平），并有一点侧向滑移
-                new_along = config.BLADE_AHEAD_MM + p["r"] + 3.0
-                slide = 0.0
-                if self.rng.random() < 0.12:
-                    slide = math.copysign(4.0, lat if lat != 0 else 1.0)
-                p["x"] = car.x + f[0] * new_along + l[0] * (lat + slide)
-                p["y"] = car.y + f[1] * new_along + l[1] * (lat + slide)
-                self.push_count += 1
-            # 墙（挡板）
+            if not car.blade_down or not (0.0 < along < config.BLADE_AHEAD_MM + p["r"] + 12.0):
+                continue
+            if abs(lat) >= half_w - p["r"] * 0.2:
+                continue
+            new_along = config.BLADE_AHEAD_MM + p["r"] + 3.0
+            slide = 0.0
+            if self.rng.random() < 0.12:
+                slide = math.copysign(4.0, lat if lat != 0 else 1.0)
+            p["x"] = car.x + f[0] * new_along + l[0] * (lat + slide)
+            p["y"] = car.y + f[1] * new_along + l[1] * (lat + slide)
+
+    def update(self, cars, t=0.0):
+        for car in cars:
+            self._push(car)
+        for p in self.pieces:
+            if p["scored"]:
+                continue
             p["x"] = max(p["r"], min(config.FIELD_L - p["r"], p["x"]))
             p["y"] = max(p["r"], min(config.FIELD_W - p["r"], p["y"]))
-            # 计分：整体进入己方球门区
-            gx0, gx1, gy0, gy1 = game.own_goal_box()
-            if (p["x"] - p["r"] >= gx0 - 1 and p["x"] + p["r"] <= gx1
-                    and p["y"] - p["r"] >= gy0 and p["y"] + p["r"] <= gy1):
-                p["scored"] = True
-                self.scored.append(p)
-
-    @property
-    def score(self):
-        return sum(p["value"] for p in self.scored)
+            g = self.goal_of(p)
+            if g is None:
+                continue
+            owner = "red" if g == "left" else "black"
+            pts = p["value"] if p["side"] == owner else -p["value"] * config.PENALTY_FACTOR
+            pts = int(round(pts))
+            self.score[owner] += pts
+            if pts > 0:
+                self.scored_count[owner] += 1
+            p["scored"] = True
+            p["owner"] = owner
+            p["pts"] = pts
+            self.events.append((round(t, 1), owner, p["char"], p["side"], pts))
 
 
 class VisionEmu:
-    """模拟前视相机：只看到车前的一块区域，带位置噪声、漏检、字符误判。"""
+    """模拟车前相机：只看车前一块；带位置噪声、漏检、字符误判。"""
 
     def __init__(self, forward_mm=520.0, half_w=400.0, noise=3.0,
                  dropout=0.05, char_err=0.08, rng=None):
@@ -221,7 +225,6 @@ class VisionEmu:
         self.rng = rng or np.random.default_rng(2)
 
     def observe(self, world, car):
-        """返回**车体坐标系**下的棋子列表（x 前，y 左），与真实相机标定的坐标系一致。"""
         th = math.radians(car.h)
         c, s = math.cos(th), math.sin(th)
         out = []
@@ -229,15 +232,15 @@ class VisionEmu:
             if p["scored"]:
                 continue
             dx, dy = p["x"] - car.x, p["y"] - car.y
-            rx = c * dx + s * dy                 # 前向
-            ry = -s * dx + c * dy                # 侧向
+            rx = c * dx + s * dy
+            ry = -s * dx + c * dy
             if not (60.0 < rx < self.forward_mm + 280.0 and abs(ry) < self.half_w):
                 continue
             if self.rng.random() < self.dropout:
                 continue
             ch = p["char"]
             if self.rng.random() < self.char_err:
-                ch = "车" if ch != "车" else "马"      # 模拟识别错一个字
+                ch = "车" if ch != "车" else "马"
             out.append({"x": rx + float(self.rng.normal(0, self.noise)),
                         "y": ry + float(self.rng.normal(0, self.noise)),
                         "r": p["r"], "side": p["side"],
@@ -247,47 +250,53 @@ class VisionEmu:
         return out
 
 
-def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None,
-                opponent=None, verbose=False, start=None, vision=None):
-    """跑一局。render=(画布函数) 时每 0.2s 画一帧。"""
+def _start_pose(side):
+    if side == "red":
+        return (config.START_L / 2, config.FIELD_W - config.START_W / 2)
+    return (config.FIELD_L - config.START_L / 2, config.START_W / 2)
+
+
+def run_episode(seed=0, seconds=None, dt=0.02, vision_hz=5.0, render=None, vision=None):
     seconds = float(seconds or config.MATCH_SECONDS)
     rng = np.random.default_rng(seed)
-    pieces = SimWorld.make_pieces(32, random.Random(seed))
-    world = SimWorld(pieces, rng)
-    sx, sy = start or (config.START_L / 2, config.FIELD_W - config.START_W / 2)
-    heading = math.degrees(math.atan2(config.PILE_CY - sy, config.PILE_CX - sx))
-    car = SimChassis(sx, sy, heading, rng=np.random.default_rng(seed + 10))
-    mem = game.FieldMemory()
-    vk = dict(vision or {})
-    emu = VisionEmu(rng=np.random.default_rng(seed + 20), **vk)
-    fsm = DecisionFSM(match_seconds=seconds)
-    fsm.start(0.0)
-
+    world = SimWorld(SimWorld.make_pieces(32, random.Random(seed)), rng)
+    cars, mems, fsms, emus = {}, {}, {}, {}
+    for i, side in enumerate(("red", "black")):
+        sx, sy = _start_pose(side)
+        tx, ty = config.PILE_CX, config.PILE_CY
+        cars[side] = SimChassis(sx, sy, math.degrees(math.atan2(ty - sy, tx - sx)),
+                                rng=np.random.default_rng(seed + 10 + i))
+        mems[side] = game.FieldMemory()
+        fsms[side] = DecisionFSM(match_seconds=seconds, side=side)
+        fsms[side].start(0.0)
+        emus[side] = VisionEmu(rng=np.random.default_rng(seed + 20 + i), **(vision or {}))
     vis_every = max(1, int(round(1.0 / (vision_hz * dt))))
     frames = 0
     for step in range(int(seconds / dt)):
         t = step * dt
         if step % vis_every == 0:
-            robot_pieces = emu.observe(world, car)
-            gs = game.build_state(robot_pieces, pose=car.pose(), memory=mem)
-            cmd = fsm.update(gs, car.pose(), t, car.is_done(),
-                             opponent=opponent(world, car) if opponent else None, memory=mem)
-            car.send(cmd)
-        car.step(dt)
-        world.update(car)
-        if render and step % max(1, int(0.2 / dt)) == 0:
-            render(world, car, fsm, t)
+            for side in ("red", "black"):
+                car = cars[side]
+                other = "black" if side == "red" else "red"
+                rp = emus[side].observe(world, car)
+                gs = game.build_state(rp, pose=car.pose(), memory=mems[side], own_side=side)
+                cmd = fsms[side].update(gs, car.pose(), t, car.is_done(),
+                                        opponent=cars[other].pose()[:2], memory=mems[side])
+                car.send(cmd)
+        for side in ("red", "black"):
+            cars[side].step(dt)
+        world.update([cars["red"], cars["black"]], t)
+        if render and step % max(1, int(0.1 / dt)) == 0:
+            render(world, cars, fsms, t)
             frames += 1
-
     return {
-        "score": world.score,
-        "scored_n": len(world.scored),
+        "score": dict(world.score),
+        "scored": dict(world.scored_count),
         "seconds": seconds,
-        "trips": fsm.trips,
-        "recoveries": fsm.recoveries,
-        "state": fsm.state,
-        "rate": world.score / max(seconds, 1e-6),
-        "left": sum(1 for p in world.pieces if not p["scored"]),
+        "trips": {s: fsms[s].trips for s in fsms},
+        "recoveries": {s: fsms[s].recoveries for s in fsms},
+        "states": {s: fsms[s].state for s in fsms},
+        "events": world.events,
         "frames": frames,
-        "history": fsm.history,
+        "pieces": world.pieces,
     }

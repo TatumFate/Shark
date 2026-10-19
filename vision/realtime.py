@@ -127,7 +127,8 @@ def rectify_window(img, H, center_mm, size_mm, mm_per_px):
 
 class RealtimeVision:
     def __init__(self, H, tpl, mm_per_px=1.5, roi_mm=800.0, center_mm=(500.0, 0.0),
-                 max_rec_per_frame=3, angle_step=None, cache_radius=None, pose=None):
+                 max_rec_per_frame=3, angle_step=None, cache_radius=None, pose=None,
+                 side=None):
         self.H = H
         self.tpl = tpl
         self.mm_per_px = mm_per_px
@@ -137,6 +138,8 @@ class RealtimeVision:
         self.angle_step = angle_step
         self.pose = pose                       # 车在场地上的位姿 (x, y, theta_deg)，用于把
                                                # 车体坐标换算成场地坐标；没有就先按原点朝向处理
+        # 本队颜色：决定守哪个门、只推哪种颜色（现场可用按钮/按键切换）
+        self.side = side or config.OWN_SIDE
         self.scoreboard = game.Scoreboard()     # 累计得分（上层状态机也可直接调用）
         self.goal_counter = game.GoalCounter()  # 视野内自动计分（入区即计）
         # 场地记忆：车头相机一帧只看得到一小块，必须把"见过的棋子"记在场地坐标里，
@@ -150,6 +153,16 @@ class RealtimeVision:
         self.stats = {"rect": 0.0, "detect": 0.0, "rec": 0.0, "total": 0.0}
         self.H_inv = None
         self._warned_blank = False
+
+    def set_side(self, side):
+        """切换红/黑队：清掉记忆和计分（球门、目标颜色都变了）。"""
+        if side == self.side:
+            return
+        self.side = side
+        self.memory.clear()
+        self.goal_counter.reset()
+        self.scoreboard.reset()
+        print(f"[换边] 当前阵营：{'红队' if side == 'red' else '黑队'}")
 
     def to_src(self, pts_mm):
         """场地/标定坐标(mm) → 原始图像像素。
@@ -282,7 +295,7 @@ class RealtimeVision:
 
         # 6) 棋局理解：区域判定 / 得分 / 目标聚类 / 推进规划
         state = game.build_state(out, pose=self.pose, scoreboard=self.scoreboard,
-                                 memory=self.memory)
+                                 memory=self.memory, own_side=self.side)
         self.scored_recent = self.goal_counter.update(state["pieces"])
         state["cum_total"] = self.goal_counter.total
         state["cum_count"] = self.goal_counter.count
@@ -329,10 +342,13 @@ def draw_raw_overlay(view, state, to_src, fps, stats, paused=False):
             sxi, syi = int(sx), int(sy)
             col = (0, 0, 255) if p["side"] == "red" else (255, 255, 255)
             cv2.drawMarker(view, (sxi, syi), col, cv2.MARKER_TILTED_CROSS, 16, 2)
-            tcol = (0, 0, 255) if p["side"] == "red" else (0, 255, 0)
+            # 红棋红字；黑棋用白字加黑边（不再用绿色，避免被误读成"第三支队伍"）
+            tcol = (0, 0, 255) if p["side"] == "red" else (255, 255, 255)
             if not p["fresh"]:
                 tcol = tuple(int(c * 0.6) for c in tcol)
-            items.append((p["char"] or "?", (sxi + 10, syi - int(fs * 1.5)), fs + 4, tcol))
+            label = (p["char"] or "?", (sxi + 10, syi - int(fs * 1.5)), fs + 4, tcol,
+                     (20, 20, 20) if p["side"] != "red" else None)
+            items.append(label)
     # 推荐簇：从"对准点"指向簇中心画一条箭头，就是推扫方向
     for c in state["plans"][:2]:
         proj = to_src([[c["plan"]["aim"][0], c["plan"]["aim"][1]], [c["x"], c["y"]]])
@@ -381,6 +397,24 @@ def top_targets(pieces, k=3):
              "x": p["x"], "y": p["y"], "score": p["score"]} for p in known[:k]]
 
 
+def draw_team_buttons(img, side):
+    """右上角画"红队/黑队"两个按钮，返回 (图, 按钮矩形)。按钮是给鼠标点的。"""
+    w, h = 78, 36
+    x0 = img.shape[1] - (2 * (w + 8) + 12)
+    y0 = 8
+    rects, items = {}, []
+    for i, (s, label) in enumerate((("red", "红队"), ("black", "黑队"))):
+        x = x0 + i * (w + 8)
+        active = (s == side)
+        fill = (70, 70, 210) if s == "red" else (55, 55, 58)
+        cv2.rectangle(img, (x, y0), (x + w, y0 + h), fill, -1)
+        cv2.rectangle(img, (x, y0), (x + w, y0 + h),
+                      (0, 255, 255) if active else (210, 210, 210), 3 if active else 1)
+        items.append((label, (x + 22, y0 + 5), 20, (255, 255, 255)))
+        rects[s] = (x, y0, x + w, y0 + h)
+    return common.put_texts_cn(img, items), rects
+
+
 def main():
     ap = argparse.ArgumentParser(description="实时棋子识别")
     ap.add_argument("--source", default="0", help="相机编号 / 视频文件 / 图片文件")
@@ -399,6 +433,8 @@ def main():
     ap.add_argument("--pose", type=float, nargs=3, default=None, metavar=("X", "Y", "THETA"),
                     help="车在场地上的位姿(x mm, y mm, 朝向度)：把车体坐标换算成场地坐标，"
                          "用于判定球门区/推进方向。接上里程计后传真实值。")
+    ap.add_argument("--side", choices=["red", "black"], default=None,
+                    help="本队颜色（决定守哪个门、只推哪种颜色）；运行中可按 1/2 或点右上角按钮切换")
     ap.add_argument("--bench", type=int, default=0, help="压测：跑 N 帧不显示，只报帧率")
     ap.add_argument("--frames", type=int, default=0, help="跑够 N 帧就退出（0=一直跑）")
     ap.add_argument("--save-every", type=int, default=0, help="每 N 帧存一张标注图（0=不存）")
@@ -415,7 +451,9 @@ def main():
     src = open_source(args.source, args.width, args.height)
     tpl = rc.load_templates()
     engine = RealtimeVision(H, tpl, args.mm_per_px, args.roi, tuple(args.center),
-                            args.max_rec_per_frame, args.angle_step, pose=args.pose)
+                            args.max_rec_per_frame, args.angle_step, pose=args.pose,
+                            side=args.side)
+    print(f"[阵营] {'红队（守左门，只推红棋）' if engine.side == 'red' else '黑队（守右门，只推黑棋）'}")
     print(f"视窗 {args.roi:.0f}mm @ {args.mm_per_px} mm/px，中心 {tuple(args.center)}，"
           f"每帧最多新认 {args.max_rec_per_frame} 枚")
 
@@ -448,10 +486,19 @@ def main():
                 print(f"     串口帧 {game.serial_frame(c['plan'], 1234)}")
         return 0
 
-    win = "realtime (q=quit s=save r=record c=clear d=rect)"
+    win = "realtime (q=quit s=save r=record c=clear d=rect 1=红 2=黑)"
     headless = False
+    btn_rects = {}
+
+    def on_mouse(event, x, y, _flags, _param):
+        if event == cv2.EVENT_LBUTTONDOWN:
+            for s, r in btn_rects.items():
+                if r[0] <= x <= r[2] and r[1] <= y <= r[3]:
+                    engine.set_side(s)
+
     try:
         cv2.namedWindow(win, cv2.WINDOW_NORMAL)
+        cv2.setMouseCallback(win, on_mouse)
     except cv2.error:
         headless = True
         print("[提示] 当前环境没有图形界面，改用无窗口模式："
@@ -476,6 +523,7 @@ def main():
         else:
             view = draw_raw_overlay(frame.copy(), state, engine.to_src,
                                     fps, engine.stats, paused)
+        view, btn_rects = draw_team_buttons(view, engine.side)
         if not headless:
             cv2.imshow(win, view)
         else:
@@ -485,6 +533,7 @@ def main():
         if args.emit_hz > 0 and time.time() - last_emit > 1.0 / args.emit_hz:
             last_emit = time.time()
             print(json.dumps({"n": len(pieces), "fresh": fresh, "cached": len(engine.cache),
+                              "side": engine.side,
                               "memory": state.get("n_memory"),
                               "ms": round(engine.stats["total"], 1),
                               "score": state.get("cum_total", 0),
@@ -507,6 +556,10 @@ def main():
         if key == ord("m"):
             engine.memory.clear()
             print("[清空场地记忆]")
+        if key == ord("1"):
+            engine.set_side("red")
+        if key == ord("2"):
+            engine.set_side("black")
         if key == ord("d"):
             show_rect = not show_rect
         if key == ord(" "):

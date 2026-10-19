@@ -29,9 +29,10 @@ from commands import Command, blade, drive, goto, idle, stop, turn  # noqa: E402
 
 
 class DecisionFSM:
-    def __init__(self, match_seconds=None, speed_mm_s=None):
+    def __init__(self, match_seconds=None, speed_mm_s=None, side=None):
         self.match_seconds = float(match_seconds or config.MATCH_SECONDS)
         self.speed = float(speed_mm_s or config.ROBOT_SPEED_MM_S)
+        self.side = side or config.OWN_SIDE      # "red" / "black"：决定守哪个门、推哪种颜色
         self.state = "IDLE"
         self.t_start = None
         self.queue = deque()
@@ -248,7 +249,7 @@ class DecisionFSM:
             return
         # 这一趟扫过的走廊里，棋子的位置全变了 → 从台账里清掉
         if memory is not None and self.target is not None:
-            gx, gy = game.own_goal_center()
+            gx, gy = game.own_goal_center(self.side)
             memory.forget_segment(self.target["x"], self.target["y"], gx, gy,
                                   config.BLADE_WIDTH_MM + 120)
         self._set("CLEARUP", "清台账")

@@ -1,11 +1,10 @@
 # -*- coding: utf-8 -*-
-"""跑决策层仿真：没有底盘、没有真棋子也能验证"选目标→推→投放"整条链。
+"""跑双队仿真并录视频：红队 vs 黑队，棋子是真棋子图形（木盘 + 汉字）。
 
 用法：
-    python strategy/run_sim.py                      # 跑 3 局，打印得分/用时/卡住次数
-    python strategy/run_sim.py --episodes 10        # 多跑几局看稳定性
-    python strategy/run_sim.py --video              # 同时录一段比赛仿真视频
-    python strategy/run_sim.py --seconds 60 --verbose
+    python strategy/run_sim.py                          # 3 局，打印比分
+    python strategy/run_sim.py --video                  # 录到 vision/data/output/sim.mp4
+    python strategy/run_sim.py --seconds 60 --seed 7
 """
 import argparse
 import sys
@@ -14,121 +13,169 @@ from pathlib import Path
 
 import cv2
 import numpy as np
+from PIL import Image, ImageDraw, ImageFont
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "vision"))
-import common  # noqa: E402
 import config  # noqa: E402
 import game  # noqa: E402
 from sim import run_episode  # noqa: E402
 
-SCALE = 0.3                      # 像素 / 毫米
+FONT = r"C:\Windows\Fonts\msyh.ttc"
+S = 0.72                      # 像素 / 毫米
+PAD_X, PAD_TOP, HUD = 64, 182, 150
+W = int(config.FIELD_L * S) + 2 * PAD_X
+H = int(config.FIELD_W * S) + PAD_TOP + 46
+TEAM_RGB = {"red": (200, 55, 55), "black": (45, 45, 48)}
 
 
-def _px(x, y):
-    return int(round(x * SCALE)) + 20, int(round(y * SCALE)) + 20
+def px(x, y):
+    return (PAD_X + x * S, PAD_TOP + y * S)
+
+
+def font(size):
+    return ImageFont.truetype(FONT, size)
+
+
+def piece_tile(char, side, dia_px):
+    """画一枚棋子（木盘 + 汉字），返回 RGBA 图。"""
+    big = dia_px * 4
+    img = Image.new("RGBA", (big, big), (0, 0, 0, 0))
+    d = ImageDraw.Draw(img)
+    c, r = big // 2, big // 2 - 2
+    d.ellipse([c - r, c - r, c + r, c + r], fill=(226, 212, 190),
+              outline=(118, 92, 66), width=max(2, big // 26))
+    d.ellipse([c - r * 0.86, c - r * 0.86, c + r * 0.86, c + r * 0.86],
+              outline=(170, 145, 110), width=max(1, big // 60))
+    f = ImageFont.truetype(r"C:\Windows\Fonts\simkai.ttf", int(big * 0.58))
+    ink = (196, 34, 40) if side == "red" else (30, 30, 32)
+    bb = d.textbbox((0, 0), char, font=f)
+    w, h = bb[2] - bb[0], bb[3] - bb[1]
+    d.text(((big - w) / 2 - bb[0], (big - h) / 2 - bb[1]), char, font=f, fill=ink)
+    return img.resize((dia_px, dia_px), Image.LANCZOS)
 
 
 class Renderer:
-    def __init__(self, out_path, fps=10):
-        self.w = int(config.FIELD_L * SCALE) + 40
-        self.h = int(config.FIELD_W * SCALE) + 40
+    def __init__(self, out_path=None, fps=10, seconds=None):
         self.out = None
         if out_path:
             path = Path(out_path)
             path.parent.mkdir(parents=True, exist_ok=True)
             self.out = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"mp4v"),
-                                       float(fps), (self.w, self.h))
+                                       float(fps), (W, H))
             print(f"[录制] {path}")
+        self.dia = int(round(config.PIECE_DIA * S))
+        self.tiles = {}
+        self.seconds = seconds
+        self.frames = 0
 
-    def __call__(self, world, car, fsm, t):
-        img = np.full((self.h, self.w, 3), 28, np.uint8)
-        cv2.rectangle(img, _px(0, 0), _px(config.FIELD_L, config.FIELD_W), (190, 190, 190), 2)
-        # 己方球门区（左，红）/ 对方（右，蓝）
-        for box, col in ((game.own_goal_box(), (0, 0, 220)), (game.rival_goal_box(), (220, 120, 0))):
-            x0, x1, y0, y1 = box
-            cv2.rectangle(img, _px(x0, y0), _px(x1, y1), col, -1)
-        # 堆放区虚线
-        p0 = _px(config.PILE_CX - config.PILE_L / 2, config.PILE_CY - config.PILE_W / 2)
-        p1 = _px(config.PILE_CX + config.PILE_L / 2, config.PILE_CY + config.PILE_W / 2)
-        cv2.rectangle(img, p0, p1, (110, 150, 110), 1)
-        # 棋子
+    def tile(self, char, side):
+        key = (char, side)
+        if key not in self.tiles:
+            self.tiles[key] = piece_tile(char, side, self.dia)
+        return self.tiles[key]
+
+    def __call__(self, world, cars, fsms, t):
+        img = Image.new("RGB", (W, H), (247, 246, 242))
+        d = ImageDraw.Draw(img)
+        # 场地
+        x0, y0 = px(0, 0)
+        x1, y1 = px(config.FIELD_L, config.FIELD_W)
+        d.rectangle([x0, y0, x1, y1], fill=(232, 232, 226), outline=(120, 120, 120), width=2)
+        # 挡板（80mm 厚的深色边框）
+        wall = int(80 * S)
+        d.rectangle([x0 - wall, y0 - wall, x1 + wall, y1 + wall], outline=(70, 70, 72), width=wall)
+        d.rectangle([x0, y0, x1, y1], fill=(232, 232, 226), outline=(120, 120, 120), width=2)
+        # 球门区
+        for side, col, txt in (("red", (232, 208, 206), "红队球门"), ("black", (210, 214, 224), "黑队球门")):
+            bx0, bx1, by0, by1 = game.own_goal_box(side)
+            d.rectangle([*px(bx0, by0), *px(bx1, by1)], fill=col, outline=(150, 150, 150), width=1)
+            d.text(px((bx0 + bx1) / 2 - 55, by0 + 20), txt, font=font(15), fill=(90, 60, 60))
+        # 堆放区
+        d.rectangle([*px(config.PILE_CX - config.PILE_L / 2, config.PILE_CY - config.PILE_W / 2),
+                     *px(config.PILE_CX + config.PILE_L / 2, config.PILE_CY + config.PILE_W / 2)],
+                    outline=(150, 170, 150), width=1)
+        # 棋子（真棋子图形）
         for p in world.pieces:
-            if p["scored"]:
-                continue
-            c = (0, 0, 230) if p["side"] == "red" else (230, 230, 230)
-            cv2.circle(img, _px(p["x"], p["y"]), max(3, int(p["r"] * SCALE)), c, -1)
-            cv2.circle(img, _px(p["x"], p["y"]), max(3, int(p["r"] * SCALE)), (60, 60, 60), 1)
+            cx, cy = px(p["x"], p["y"])
+            tile = self.tile(p["char"], p["side"])
+            img.paste(tile, (int(cx - tile.width / 2), int(cy - tile.height / 2)), tile)
         # 车 + 推板
-        cx, cy = _px(car.x, car.y)
-        th = np.radians(car.h)
-        f = np.array([np.cos(th), np.sin(th)])
-        l = np.array([-f[1], f[0]])
-        tri = np.array([_px(car.x + f[0] * 90, car.y + f[1] * 90),
-                        _px(car.x - f[0] * 60 + l[0] * 55, car.y - f[1] * 60 + l[1] * 55),
-                        _px(car.x - f[0] * 60 - l[0] * 55, car.y - f[1] * 60 - l[1] * 55)])
-        cv2.fillPoly(img, [tri.astype(np.int32)], (60, 200, 60))
-        if car.blade_down:
-            hw = config.BLADE_WIDTH_MM / 2
-            b0 = (car.x + f[0] * config.BLADE_AHEAD_MM + l[0] * hw,
-                  car.y + f[1] * config.BLADE_AHEAD_MM + l[1] * hw)
-            b1 = (car.x + f[0] * config.BLADE_AHEAD_MM - l[0] * hw,
-                  car.y + f[1] * config.BLADE_AHEAD_MM - l[1] * hw)
-            cv2.line(img, _px(*b0), _px(*b1), (60, 220, 255), 4)
-        # 文案
-        st = fsm.status(t)
-        items = [
-            (f"{st['state']}   得分 {world.score}   剩余 {st['remain']:.0f}s   "
-             f"趟数 {st['trips']}   脱困 {st['recoveries']}", (8, 4), 18, (0, 255, 255)),
-            (f"目标 {st['target'] or '-'}   指令 {st['cmd']}", (8, 26), 16, (0, 255, 0)),
-        ]
+        for side, car in cars.items():
+            col = TEAM_RGB[side]
+            th = np.radians(car.h)
+            f = np.array([np.cos(th), np.sin(th)])
+            l = np.array([-f[1], f[0]])
+            pts = [px(car.x + f[0] * 120, car.y + f[1] * 120),
+                   px(car.x - f[0] * 80 + l[0] * 95, car.y - f[1] * 80 + l[1] * 95),
+                   px(car.x - f[0] * 80 - l[0] * 95, car.y - f[1] * 80 - l[1] * 95)]
+            d.polygon(pts, fill=col, outline=(255, 255, 255), width=2)
+            if car.blade_down:
+                hw = config.BLADE_WIDTH_MM / 2
+                b0 = px(car.x + f[0] * config.BLADE_AHEAD_MM + l[0] * hw,
+                        car.y + f[1] * config.BLADE_AHEAD_MM + l[1] * hw)
+                b1 = px(car.x + f[0] * config.BLADE_AHEAD_MM - l[0] * hw,
+                        car.y + f[1] * config.BLADE_AHEAD_MM - l[1] * hw)
+                d.line([b0, b1], fill=col, width=5)
+            d.text((px(car.x, car.y)[0] - 18, px(car.x, car.y)[1] + 10),
+                   "红队" if side == "red" else "黑队", font=font(16), fill=(255, 255, 255))
+        # HUD
+        remain = max(0.0, (self.seconds or config.MATCH_SECONDS) - t)
+        d.text((PAD_X, 14), "智能车光电象棋对抗 · 双队仿真（只能推自己颜色，推错扣分）",
+               font=font(20), fill=(30, 30, 30))
+        d.text((PAD_X, 44), f"红队 {world.score['red']:3d} 分（{world.scored_count['red']} 枚）   "
+                            f"黑队 {world.score['black']:3d} 分（{world.scored_count['black']} 枚）   "
+                            f"剩余 {remain:4.1f}s",
+               font=font(22), fill=(20, 20, 20))
+        y = 74
+        for side in ("red", "black"):
+            st = fsms[side].status(t)
+            d.text((W - 520, y), f"{'红' if side == 'red' else '黑'}: {st['state']}",
+                   font=font(15), fill=TEAM_RGB[side])
+            y += 24
+        if world.events:
+            e = world.events[-1]
+            cn = lambda s: "红" if s == "red" else "黑"  # noqa: E731
+            txt = f"最近：{cn(e[1])}队 {'+' if e[4] > 0 else ''}{e[4]} 分（{cn(e[3])}方 {e[2]}）"
+            d.text((PAD_X, H - 30), txt, font=font(14), fill=(110, 110, 110))
+        frame = cv2.cvtColor(np.asarray(img), cv2.COLOR_RGB2BGR)
         if self.out is not None:
-            img = common.put_texts_cn(img, items)
-            self.out.write(img)
-        else:
-            cv2.imshow("sim", common.put_texts_cn(img, items))
-            cv2.waitKey(1)
+            self.out.write(frame)
+        self.frames += 1
 
     def close(self):
         if self.out is not None:
             self.out.release()
-        else:
-            cv2.destroyAllWindows()
 
 
 def main():
-    ap = argparse.ArgumentParser(description="决策层仿真")
+    ap = argparse.ArgumentParser()
     ap.add_argument("--episodes", type=int, default=3)
-    ap.add_argument("--seconds", type=float, default=None, help="单局时长（默认 config.MATCH_SECONDS）")
-    ap.add_argument("--video", action="store_true", help="录一段仿真视频到 data/output/sim.mp4")
-    ap.add_argument("--noise", type=float, default=3.0, help="视觉位置噪声(mm)")
-    ap.add_argument("--dropout", type=float, default=0.05, help="视觉漏检率")
-    ap.add_argument("--char-err", type=float, default=0.08, help="字符误判率")
+    ap.add_argument("--seconds", type=float, default=None)
+    ap.add_argument("--seed", type=int, default=1000)
+    ap.add_argument("--video", action="store_true")
     ap.add_argument("--out", default=None)
-    ap.add_argument("--verbose", action="store_true")
     args = ap.parse_args()
-
     rows = []
     t0 = time.perf_counter()
     for i in range(args.episodes):
-        renderer = Renderer(args.out or (str(config.DIR_OUTPUT / "sim.mp4") if args.video and i == 0 else None))
-        r = run_episode(seed=1000 + i, seconds=args.seconds, render=renderer,
-                        vision={"noise": args.noise, "dropout": args.dropout,
-                                "char_err": args.char_err})
-        renderer.close()
+        path = (args.out or str(config.DIR_OUTPUT / "sim.mp4")) if (args.video and i == 0) else None
+        rnd = Renderer(path, seconds=args.seconds)
+        r = run_episode(seed=args.seed + i, seconds=args.seconds, render=rnd)
+        rnd.close()
         rows.append(r)
-        print(f"第 {i + 1} 局：得分 {r['score']:3d}（{r['scored_n']:2d} 枚）  "
-              f"趟数 {r['trips']:2d}  脱困 {r['recoveries']:2d}  "
-              f"结束状态 {r['state']}  分/秒 {r['rate']:.2f}  剩余未进区 {r['left']}")
-        if args.verbose:
-            print("   状态轨迹：", " → ".join(f"{h[1]}" for h in r["history"][:14]), "…")
-
-    scores = [r["score"] for r in rows]
-    print("-" * 66)
-    print(f"{len(rows)} 局：平均 {np.mean(scores):.1f} 分，最高 {max(scores)}，最低 {min(scores)}；"
-          f"平均趟数 {np.mean([r['trips'] for r in rows]):.1f}；"
-          f"平均脱困 {np.mean([r['recoveries'] for r in rows]):.1f}")
-    print(f"仿真耗时 {time.perf_counter() - t0:.1f}s（单局 {args.seconds or config.MATCH_SECONDS:.0f}s 比赛时长）")
+        print(f"第 {i + 1} 局：红队 {r['score']['red']:4d} 分（{r['scored']['red']} 枚，"
+              f"{r['trips']['red']} 趟） | 黑队 {r['score']['black']:4d} 分"
+              f"（{r['scored']['black']} 枚，{r['trips']['black']} 趟）"
+              f" | 脱困 红{r['recoveries']['red']}/黑{r['recoveries']['black']}")
+        bad = [e for e in r["events"] if e[4] < 0]
+        if bad:
+            print("   误推扣分：", "；".join(f"{e[1]}队 {e[3]}方{e[2]} {e[4]}" for e in bad[:5]))
+    print("-" * 70)
+    for side, name in (("red", "红队"), ("black", "黑队")):
+        sc = [r["score"][side] for r in rows]
+        print(f"{name}：平均 {np.mean(sc):.1f} 分，最高 {max(sc)}，最低 {min(sc)}")
+    print(f"仿真耗时 {time.perf_counter() - t0:.1f}s")
     if args.video:
         print(f"视频：{args.out or config.DIR_OUTPUT / 'sim.mp4'}")
     return 0

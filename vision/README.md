@@ -119,6 +119,11 @@ python vision/pipeline.py --image vision/data/synthetic/field_oblique.png --mode
 
 ## 七、实时化（realtime.py）
 
+**阵营（红/黑）现场可切换**：右上角有「红队 / 黑队」两个按钮（鼠标点），
+也可以按 `1`/`2`，或启动时加 `--side red|black`。
+切换会清空场地记忆和计分，并按新阵营重算"守哪个门、只推哪种颜色"。
+（规则：只能推自己颜色；对方颜色进己方门按 `config.PENALTY_FACTOR` 扣分。）
+
 比赛是实时的，但**算子完全相同**：`pipeline.py` 是"一帧"的版本，`realtime.py` 就是把它放进循环。
 区别在三个工程改造，实测把单帧从 780 ms 压到 30 ms 左右：
 

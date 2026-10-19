@@ -112,12 +112,19 @@ def put_texts_cn(img, items):
 
     实时循环里必须用这个：put_text_cn 每调一次都要把整幅图转成 PIL 再转回来，
     画十几条标签就会白吃掉几十毫秒。
+    也支持 5 元组 (文本, 位置, 字号, 颜色, 描边颜色)——浅色背景上写白字时需要描边。
     """
     pil = Image.fromarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
     draw = ImageDraw.Draw(pil)
-    for text, org, size, color in items:
+    for item in items:
+        text, org, size, color = item[0], item[1], item[2], item[3]
+        stroke = item[4] if len(item) > 4 else None
+        kw = {}
+        if stroke is not None:
+            kw = {"stroke_width": 2,
+                  "stroke_fill": (int(stroke[2]), int(stroke[1]), int(stroke[0]))}
         draw.text((int(org[0]), int(org[1])), text, font=_font(size),
-                  fill=(int(color[2]), int(color[1]), int(color[0])))
+                  fill=(int(color[2]), int(color[1]), int(color[0])), **kw)
     return cv2.cvtColor(np.asarray(pil), cv2.COLOR_RGB2BGR)
 
 
