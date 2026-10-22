@@ -172,3 +172,37 @@ python strategy/push_demo.py --layout pile --rule own --seconds 90 --no-render
 
 规则原文目前只写“按棋子对应分值累计得分”，**没有写颜色限制**；
 这一点必须先向组委会确认，再决定是否把推板加宽成“宽扫堆”。
+
+---
+
+## 宽推扫堆（2026-10-22 新增，当前主方案）
+
+规则只允许“推板、滚轮等推进机构”，抓钩/夹爪属于灰区；因此主方案改为
+**300mm 折叠宽推**：发车 200mm，工作时展开 300mm，从棋堆右侧整排扫向左侧球门。
+
+程序：`strategy/wide_push.py`
+
+```powershell
+python strategy/wide_push.py --seconds 42 --video
+```
+
+真实棋堆（`vision/data/output/pipeline.json`，32 枚、总分 179）结果：
+
+| 指标 | 数值 |
+| --- | --- |
+| 总分 | 179 / 179 |
+| 进区 | 32 / 32 枚 |
+| 趟数 | 3 趟（y=1000 → 1200 → 800） |
+| 用时 | 35.3 s |
+| 效率 | 5.1 分/秒 |
+
+### 两套算法
+
+| 模式 | 程序 | 适用 |
+| --- | --- | --- |
+| ALL 任意颜色 | `wide_push.py` | 规则不分颜色；宽推扫堆 |
+| OWN 只推红 | `push_demo.py --rule own --side red` | 只算己方颜色；120mm 窄推 |
+| OWN 只推黑 | `push_demo.py --rule own --side black`（镜像待回归） | 同构镜像配置 |
+
+> 规则没有写颜色限制，也没有写“只能推己方”。
+> 已把两种规则都做成可切换参数；宽推的得分效率比窄推高约 5 倍。

@@ -1263,22 +1263,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--layout", choices=["grid", "lane", "spread", "pile"], default="grid")
     ap.add_argument("--rule", choices=["any", "own"], default="any")
+    ap.add_argument("--side", choices=["red", "black"], default="red",
+                    help="OWN 模式只推哪一方")
     ap.add_argument("--seconds", type=float, default=170.0)
     ap.add_argument("--seed", type=int, default=7)
     ap.add_argument("--video", action="store_true")
     ap.add_argument("--out", default=None)
     ap.add_argument("--no-render", action="store_true")
     args = ap.parse_args()
+    if args.rule == "own" and args.side == "black":
+        print("OWN-black 的镜像回归还没做完：先把红方跑通，规则确认后再补黑方镜像。")
+        return 2
 
     pieces = make_pieces(args.layout, args.seed)
     world = PushWorld(pieces, rule=args.rule)
     if args.layout in ("grid", "lane"):
         car = Car(2900.0, 1000.0, 180.0, rng=np.random.default_rng(args.seed))
         ctrl = (GridFeeder if args.layout == "grid" else LaneFeeder)(
-            world, car, side="red", rule=args.rule)
+            world, car, side=args.side, rule=args.rule)
     else:
         car = Car(320.0, config.FIELD_W - 210.0, 0.0, rng=np.random.default_rng(args.seed))
-        ctrl = Peeler(world, car, side="red", rule=args.rule)
+        ctrl = Peeler(world, car, side=args.side, rule=args.rule)
     if args.video:
         if args.layout == "grid":
             title = "场景 A：4×4 取棋工位 · 32 枚连续回收（16 趟，每趟 2 枚）"
